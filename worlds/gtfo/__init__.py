@@ -31,44 +31,6 @@ class GTFORegion(Region):
         if hint is None:
             hint = name + " !hint!" ## So I can figure out how this works
         super().__init__(name, player, multiworld, hint)
-        multiworld.regions.append(self)
-
-class GTFORegionZ(GTFORegion):
-    game: str = "GTFO"
-    data: ZoneData
-
-    def __init__(self, name: str, player: int, multiworld: MultiWorld, data: ZoneData, hint: Optional[str] = None):
-        super().__init__(name, player, multiworld, hint)
-        self.data = data
-
-class GTFOLevel():
-    ## Note: Not a region
-    name: str
-    data: LevelData
-    zones: List[GTFORegionZ]
-
-    def __init__(self, name: str, data: LevelData, zones: List[GTFORegionZ]):
-        self.name = name
-        self.data = data
-        self.zones = zones
-
-
-class GTFORegionEx(GTFORegion):
-    main_level: GTFOLevel
-    secondary_level: Optional[GTFOLevel]
-    overload_level: Optional[GTFOLevel]
-    dimension_levels: Dict[int, GTFOLevel]
-
-    def __init__(self, 
-           name: str, player: int, multiworld: MultiWorld, 
-           main: GTFOLevel, secondary: Optional[GTFOLevel], overload: Optional[GTFOLevel],
-           dimensions: Dict[int, GTFOLevel], hint: Optional[str] = None):
-        super().__init__(name, player, multiworld, hint)
-        self.main_level = main
-        self.secondary_level = secondary
-        self.overload_level = overload
-        self.dimension_levels = dimensions
-
 
 
 class GTFOSettings(settings.Group):
@@ -154,7 +116,7 @@ class GTFOWorld(World):
     location_name_to_id = {}
 
     modded_instance_data: ModdedInstanceData
-    required_expeditions: List[ExpeditionData] = []
+    required_expeditions: List[Expedition] = []
     filler_weights: List[float] = []
     trap_weights: List[float] = []
 
@@ -195,7 +157,7 @@ class GTFOWorld(World):
         self.required_expeditions = []
         
         for exp in self.modded_instance_data.expeditions:
-            if exp.name in req_expedition_names:
+            if exp.name.lower() in req_expedition_names:
                 self.required_expeditions.append(exp)
                 found_expedition_names.append(exp.name)
 
@@ -222,62 +184,64 @@ class GTFOWorld(World):
 
 
     def create_regions(self) -> None:
-        """Method for creating and connecting regions for the World."""
-        """We're going to do basically all our work in this one function"""
-
-        ## Menu region
-        ex_region = GTFORegionEx()
+        """
+        Method for creating and connecting regions for the World.
+        We're going to do basically all our work in this one function
+        """
 
         menu_region = GTFORegion("Menu", self.player, self.multiworld)
 
-        for ex_data in self.required_expeditions:
-            expedition_region = self.create_expedition_region(ex_data)
+        ## Item required to win (and progress, if enabled)
+        lock_name = None
+        if self.options.require_all_objectives.value:
+            lock_name = "Unlock Next Expedition"
+        else:
+            lock_name = "Unlock Next Expedition (Main Only)"
 
+        count = 0
+        for expedition in self.required_expeditions:
+            regions = [ GTFORegion(r.name, self.player, self.multiworld) for r in expedition.regions ]
+            
+            ## Connect to menu and optionally lock
+            entrance = menu_region.connect(regions[expedition.start_region])
+            if self.options.lock_expeditions.value:
+                entrance.access_rule = lambda state: state.has(lock_name, self.player, count)
+            
+            ## Progress required count based on options
+            if self.options.require_all_objectives.value:
+                count += expedition.num_sectors
+            else:
+                count += 1
 
-    def create_expedition_region(self, ex_data: ExpeditionData) -> GTFORegion:
-        """Create regions for an expedition. Returns the first region in the expedition"""
+            ## Paths
+            for path in expedition.paths:
+                entrance = regions[path.starting_region].connect(regions[path.ending])
+                
+                if path.required_item is not None:
+                    rule = None
+                    if path.alternate_item is not None:
+                        rule = lambda state: state.has(path.required_item, self.player, path.required_item_count) \
+                            or state.has(path.alternate_item, self.player)
+                    else:
+                        rule = lambda state: state.has(path.required_item, self.player, path.required_item_count)
+                    Rules.set_rule(entrance, rule)
 
-        ex_region = GTFORegion(f"{ex_data.name} (Expedition)", self.player, self.multiworld)
-        
-        def make_level(l: LevelData, s: str) -> List[GTFORegion]:
-            return [ 
-                GTFORegion(
-                    f"{ex_data.name} ({s}) ZONE_{z_data.alias}", 
-                    self.player, 
-                    self.multiworld
-                ) for z_data in l.zones 
-            ]
+            ## Locations
+            for loc in expedition.locations:
+                location = GTFOLocation(loc.name, self.player, self.multiworld, regions[loc.regions[0]])
+                item = GTFOItem(loc.item_name, ItemClassification.progression, None, self.player)
 
-        main_level = make_level(ex_data.main_level, "Main")
-        secondary_level = make_level(ex_data.main_level, "Secondary")
-        overload_level = make_level(ex_data.main_level, "Overload")
-        dimension_levels = {
-            k: make_level(v, f"Dimension #{k}") for k, v in ex_data.dimension_data.items()
-        }
+                ## TODO: Decouple the item and location if necessary
+                loc.place_locked_item(item)
 
-        levels = [main_level, secondary_level, overload_level]
+                if len(loc.regions) > 1:
+                    Rules.set_rule(
+                        location, 
+                        lambda state: all(state.can_reach(r, self.player) for r in loc.regions[1:])
+                    )
 
-        for level in itertools.chain(levels, dimension_levels.values()):
-
-            for z_data in l_data.zones:
-
-
-
-            pass
-        ## Process events and stuff for each level
-
-        return ex_region
-
-
-    def decouple_item(self, loc: GTFOLocation, item: GTFOItem):
-        """
-        Given an item and its normal location, decide whether to submit both to the multiworld or
-        to lock the item to its location.
-        """
-        ## TODO: Probably replace this with actual code at some point
-        loc.place_locked_item(item)
-
-
+        self.multiworld.completion_condition[self.player] = lambda state: state.has(lock_name, self.player, count)
+                
     def create_item(self, item_name: str) -> GTFOItem:
         """
         Create an item for this world type and player.
@@ -289,6 +253,10 @@ class GTFOWorld(World):
         return GTFOItem(item_name, classification, None, self.player)
 
     def create_filler(self) -> GTFOItem:
+        """
+        Create a random filler item, which may be a trap item
+        """
+
         ran: float = self.random.random()
         if ran < self.trap_percent:
             choice = self.random.choices(self.modded_instance_data.traps, cum_weights=self.trap_weights, k=1)[0]
@@ -302,33 +270,6 @@ class GTFOWorld(World):
         Method for creating and submitting items to the itempool. Items and Regions must *not* be created and submitted
         to the MultiWorld after this step. If items need to be placed during pre_fill use `get_pre_fill_items`.
         """
-        used_locations = 0
-        if self.options.lock_expeditions.value:
-            for expedition_name in self.required_expeditions:
-                self.multiworld.itempool.append(
-                    GTFOItem(f"unlock_expedition_{expedition_name}", ItemClassification.progression, None, self.player)
-                )
-                used_locations += 1
-
-        if self.options.lock_gear.value:
-            for gear_name in self.modded_instance_data.gear_names:
-                if gear_name in self.options.starting_gear.value:
-                    continue
-                self.multiworld.itempool.append(
-                    GTFOItem(f"unlock_gear_{gear_name}", ItemClassification.useful, None, self.player)
-                )
-                used_locations += 1
-
-        for _ in range(self.options.lock_player_slots):
-            self.multiworld.itempool.append(
-                GTFOItem("unlock_player_slot", ItemClassification.useful, None, self.player)
-            )
-            used_locations += 1
-
-        filler_count: int = self.location_count - used_locations
-        if filler_count < 0:
-            raise "Unexpected failure: insufficient locations during GTFO generation!"
-        self.multiworld.itempool += [ self.create_filler() for _ in range(filler_count) ]
 
 
     #def set_rules(self) -> None:

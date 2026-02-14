@@ -1,289 +1,266 @@
 
-from typing import Any, Dict, List, Optional, Mapping, Union
+import numbers
+from typing import Any, List, Mapping, Optional, Tuple
 
-# Basic types
-class WeightedItem:
+class Region:
+    """Represents a region"""
+
+    def __init__(self, data: Mapping[str, Any]):
+        """Create a Region from json"""
+        
+        if not isinstance(data, dict):
+            raise TypeError("Location expects a dict")
+
+        self.name = data.get("name")
+        if not isinstance(self.name, str):
+            raise TypeError("'Region.name' must be a string")
+
     name: str
-    weight: float
-
-    def __init__(self, json: Dict[str, Any]):
-        self.name = json["name"]
-        self.weight = float(json["weight"])
+    """Unique name of the region, used to identify it"""
 
 
-class ZonePosition:
-    local_index: int
-    dimension_index: int
+class Location:
+    """Represents a location where an item may be found. Includes the item normally found there"""
 
-    def __init__(self, json: Dict[str, Any]):
-        self.local_index = int(json["local_index"])
-        self.dimension_index = int(json["dimension_index"])
+    def __init__(self, data: Mapping[str, Any]):
+        """Create a Location from json"""
 
+        if not isinstance(data, dict):
+            raise TypeError("Location expects a dict")
 
-class KeyData:
-    type: str
-    zone_alias: int
-    terminal_index: int
-    positions: List[ZonePosition]
-
-    def __init__(self, json: Dict[str, Any]):
-        self.type = str(json["type"])
-        self.zone_alias = int(json["zone_alias"])
-        self.terminal_index = int(json["terminal_index"])
-        self.positions = [ ZonePosition(x) for x in json["positions"] ]
-
-
-class BigPickupData:
-    item_type: int
-
-    def __init__(self, json: Dict[str, Any]):
-        self.item_type = int(json["item_type"])
-
-
-# Event actions
-class WardenAction:
-    def __init__(self, json: Dict[str, Any]):
-        # Base action has no fields by default
-        pass
-
-
-class SpecificZoneEventAction(WardenAction):
-    target_zone_local_index: int
-    target_zone_layer: int
-    target_zone_dimension: int
-
-    def __init__(self, json: Dict[str, Any]):
-        self.target_zone_local_index = int(json["target_zone_local_index"])
-        self.target_zone_layer = int(json["target_zone_layer"])
-        self.target_zone_dimension = int(json["target_zone_dimension"])
-
-
-class StartScanEventAction(SpecificZoneEventAction):
-    scan_name: str
-
-    def __init__(self, json: Dict[str, Any]):
-        super().__init__(json)
-        self.scan_name = str(json["scan_name"])
-
-
-class WarpEventAction(WardenAction):
-    target_dimension_index: int
-    target_zone_local_index: int
-
-    def __init__(self, json: Dict[str, Any]):
-        self.target_dimension_index = int(json["target_dimension_index"])
-        self.target_zone_local_index = int(json["target_zone_local_index"])
-
-
-class ObjectiveEventAction(WardenAction):
-    objective_layer: int
-
-    def __init__(self, json: Dict[str, Any]):
-        self.objective_layer = int(json["objective_layer"])
-
-
-# WardenEvent and subclasses
-class WardenEvent:
-    type: str
-    action_data: Optional[WardenAction]
-
-    def __init__(self, json: Dict[str, Any]):
+        self.name = str(data.get("name"))
+        if not isinstance(self.name, str):
+            raise TypeError("'Location.name' must be a string")
         
-        type_mapping = {
-            "UnlockZoneDoor":           SpecificZoneEventAction,
-            "OpenZoneDoor":             SpecificZoneEventAction,
-            "StepObjectiveProgression": ObjectiveEventAction,
-            "ForceCompleteObjective":   ObjectiveEventAction,
-            "ForceInstantWin":          ObjectiveEventAction,
-            "ActivateWinOnDeath":       ObjectiveEventAction,
-            "DimensionWarp":            WarpEventAction,
-            "StartScan":                StartScanEventAction,
-        }
-        
-        self.type = str(json["type"])
-        self.action_data = type_mapping[self.type](json["action_data"])
+        self.item = str(data.get("item"))
+        if not isinstance(self.item, str):
+            raise TypeError("'Location.item' must be a string")
+
+        raw_regions = data.get("regions")
+        if not isinstance(self.item, list):
+            raise TypeError("'Location.regions' must be a list")
+
+        self.regions = [ int(r) if isinstance(r, numbers.Number) else None for r in raw_regions ]
+        if None in self.regions:
+            raise TypeError("'Location.regions' must be a list of numbers")
+
+    name: str
+    """Unique name of the location, used to identify it"""
+
+    item: str
+    """Item typically located in this location"""
+
+    regions: List[int]
+    """Regions this location can be in"""
 
 
-class ApproachZoneEvent(WardenEvent):
-    target_alias: int
+class Path:
+    """
+    Represents a directed path between regions. Entrances in each region are implied.
+    """
 
-    def __init__(self, json: Dict[str, Any]):
-        super().__init__(json)
-        self.target_alias = int(json["target_alias"])
+    def __init__(self, data: Mapping[str, Any]):
+        """Create a Path from json"""
 
+        if not isinstance(data, dict):
+            raise TypeError("Path expects a dict")
 
-class TriggerEvent(WardenEvent):
-    trigger_name: str
-
-    def __init__(self, json: Dict[str, Any]):
-        super().__init__(json)
-        self.trigger_name = str(json["trigger_name"])
-
-
-# Objective data classes
-class ObjectiveData:
-    objective_type: str
-    sub_objective_count: int
-    positions: List[List[ZonePosition]]
-    events_on_activate: List[List[WardenEvent]]
-    events_on_goto_win: List[WardenEvent]
-
-    def __init__(self, json: Dict[str, Any]):
-        self.objective_type = str(json["objective_type"])
-        self.sub_objective_count = int(json["sub_objective_count"])
-        self.positions = [ [ ZonePosition(y) for y in x ] for x in json["positions"] ]
-        self.events_on_activate = [ [ WardenEvent(y) for y in x ] for x in json["events_on_activate"] ]
-        self.events_on_goto_win = [ WardenEvent(x) for x in json["events_on_goto_win"] ]
-
-    @classmethod
-    def make(json: Dict[str, Any]) -> "ObjectiveData":
-        t = str(json["objective_type"])
-        if t in ["ReactorStartup", "ReactorStartup_Empty"]:
-            return ReactorStartupObjectiveData(json)
-        elif t == "TimedTerminalSequence":
-            return TimedSequenceObjectiveData(json)
+        self.starting_region = data.get("starting_region")
+        if isinstance(self.starting_region, numbers.Number):
+            self.starting_region = int(self.starting_region)
         else:
-            return ObjectiveData(json)
+            raise TypeError("'Path.starting_region' is incorrectly defined")
+
+        self.ending_region = int(data.get("ending_region", 0))
+        if isinstance(self.ending_region, numbers.Number):
+            self.ending_region = int(self.ending_region)
+        else:
+            raise TypeError("'Path.ending_region' is incorrectly defined")
+
+        self.required_item = data.get("required_item")
+        if self.required_item is not None and not isinstance(self.required_item, str):
+            raise TypeError("'Path.required_item' must be a string or null")
+
+        self.required_item_count = data.get("required_item_count")
+        if isinstance(self.required_item_count, numbers.Number):
+            self.required_item_count = int(self.required_item_count)
+        else:
+            raise TypeError("'Path.required_item_count' is incorrectly defined")
+
+        self.alternate_item =  data.get("alternate_item")
+        if self.alternate_item is not None and not isinstance(self.alternate_item, str):
+            raise TypeError("'Path.alternate_item' must be a string or null")
+
+    """Region this path starts in"""
+    starting_region: int
+    
+    """Region this path ends in"""
+    ending_region: int
+    
+    """Item required to traverse this path"""
+    required_item: Optional[str]
+    
+    """Number of required items needed to traverse this path"""
+    required_item_count: int
+
+    """
+    Alternate item required to traverse this path
+    - If there is no required item, this is ignored (by design)
+    - The alternate item is assumed to only require one count to traverse the path
+    - This is intended for door unlock events (since all zone doors can be force unlocked via an event)
+    """
+    alternate_item: Optional[str]
 
 
-class ReactorStartupObjectiveData(ObjectiveData):
-    wave_count: int
-    events_on_finish_wave: List[List[WardenEvent]]
+class WeightedItem:
+    """Associates an item with a weight for randomization purposes"""
+    
+    def __init__(self, data: Mapping[str, Any]):
+        """Creates a WeightedItem from json"""
 
-    def __init__(self, json: Dict[str, Any]):
-        super().__init__(json)
-        self.wave_count = int(json["wave_count"])
-        self.events_on_finish_wave = [ [ WardenEvent(y) for y in x ] for x in json["events_on_finish_wave"] ]
+        if not isinstance(data, dict):
+            raise TypeError("Expedition expects a dict")
 
+        self.name = data.get("name")
+        if not isinstance(self.name, str):
+            raise TypeError("'WeightedItem.name' must be a string")
 
-class TimedSequenceObjectiveData(ObjectiveData):
-    num_rounds: int
-    events_on_start_round: List[List[WardenEvent]]
-    events_on_succeed_round: List[List[WardenEvent]]
-    events_on_fail_round: List[List[WardenEvent]]
+        self.weight = data.get("weight")
+        if isinstance(self.weight, numbers.Number):
+            self.weight = float(self.weight)
+        else:
+            raise TypeError("'WeightedItem.weight' must be a number")
 
-    def __init__(self, json: Dict[str, Any]):
-        super().__init__(json)
-        self.num_rounds = int(json["num_rounds"])
-        self.events_on_start_round   = [ [ WardenEvent(y) for y in x ] for x in json["events_on_start_round"] ]
-        self.events_on_succeed_round = [ [ WardenEvent(y) for y in x ] for x in json["events_on_succeed_round"] ]
-        self.events_on_fail_round    = [ [ WardenEvent(y) for y in x ] for x in json["events_on_fail_round"] ]
-
-
-class CommandData:
-    command_name: str
-    events: List[WardenEvent]
-
-    def __init__(self, json: Dict[str, Any]):
-        self.command_name = json["command_name"]
-        self.events = [ WardenEvent(x) for x in json["events"] ]
-
-
-class TerminalData:
-    passwordCount: int
-    commands: List[CommandData]
-    logs: List[str]
-
-    def __init__(self, json: Dict[str, Any]):
-        self.password_count = int(json["password_count"])
-        self.commands = [ CommandData(x) for x in json["commands"] ]
-        self.logs = [ str(x) for x in json["logs"] ]
-
-
-class ZoneData:
-    alias: int
-    entrance_index: int
-    lock_type: str
-    terminals: List[TerminalData]
-    big_pickups: List[BigPickupData]
-    events_on_unlock_door: List[WardenEvent]
-    events_on_door_scan_start: List[WardenEvent]
-    events_on_door_scan_done: List[WardenEvent]
-    events_on_open_door: List[WardenEvent]
-    events_on_boss_death: List[WardenEvent]
-    events_on_portal_warp: List[WardenEvent]
-    events_on_trigger: List['TriggerEvent']
-    events_on_approach_zone: List['ApproachZoneEvent']
-
-    def __init__(self, json: Dict[str, Any]):
-        self.alias = int(json["alias"])
-        self.entrance_index = int(json["entrance_index"])
-        self.lock_type = str(json["lock_type"])
-        self.terminals = [ TerminalData(x) for x in json["terminals"] ]
-        self.big_pickups = [ BigPickupData(x) for x in json["big_pickups"] ]
-
-        self.events_on_unlock_door     = [ [ WardenEvent(x) for x in y ] for y in json["events_on_unlock_door"    ] ]
-        self.events_on_door_scan_start = [ [ WardenEvent(x) for x in y ] for y in json["events_on_door_scan_start"] ]
-        self.events_on_door_scan_done  = [ [ WardenEvent(x) for x in y ] for y in json["events_on_door_scan_done" ] ]
-        self.events_on_open_door       = [ [ WardenEvent(x) for x in y ] for y in json["events_on_open_door"      ] ]
-        self.events_on_boss_death      = [ [ WardenEvent(x) for x in y ] for y in json["events_on_boss_death"     ] ]
-        self.events_on_portal_warp     = [ [ WardenEvent(x) for x in y ] for y in json["events_on_portal_warp"    ] ]
-        self.events_on_trigger         = [ [TriggerEvent(x) for x in y ] for y in json["events_on_trigger"        ] ]
-        self.events_on_approach_zone = [ 
-            [ ApproachZoneEvent(x) for x in y ] for y in json["events_on_approach_zone"] 
-        ]
-
-
-class LevelData:
-    start_zone: int
-    zones: List[ZoneData]
-    keys: List[KeyData]
-    objectives: List[ObjectiveData]
-    events_on_approach_level: List[ApproachZoneEvent]
-
-    def __init__(self, json: Dict[str, Any]):
-        self.start_zone = int(json["start_zone"])
-        self.zones = [ZoneData(x) for x in json["zones"] ]
-        self.keys  = [ KeyData(x) for x in json["keys"] ]
-        self.objectives = [ ObjectiveData.make(x) for x in json["objectives"] ]
-        self.events_on_approach_level = [ ApproachZoneEvent(x) for x in json["events_on_approach_level"] ]
-
-
-class BuildFromData:
-    layer_index: int
-    zone_index: int
-
-    def __init__(self, json: Dict[str, Any]):
-        self.layer_index = int(json["layer_index"])
-        self.zone_index = int(json["zone_index"])
-
-
-class ExpeditionData:
     name: str
-    main_level: LevelData
-    secondary_level: Optional[LevelData]
-    secondary_build_from: BuildFromData
-    overload_level: Optional[LevelData]
-    overload_build_from: BuildFromData
-    dimension_data: Dict[int, LevelData]
-    events_on_elevator_land: List[WardenEvent]
-    events_on_progress_exit_scan: List[WardenEvent]
+    """Name of the item"""
 
-    def __init__(self, json: Dict[str, Any]):
-        self.name = str(json["name"])
-        self.main_level = LevelData(json["main_level"])
-        
-        sec_json = json.get("secondary_level")
-        self.secondary_level = None if sec_json is None else LevelData(sec_json)
-        self.secondary_build_from = BuildFromData(json["secondary_build_from"])
+    weight: float
+    """Weight of the item"""
 
-        ovl_json = json.get("overload_level")
-        self.overload_level = None if ovl_json is None else LevelData(ovl_json)
-        self.overload_build_from = BuildFromData(json["overload_build_from"])
 
-        self.dimension_data = { int(k): LevelData(v) for k, v in json["dimension_data"].items() }
-        self.events_on_elevator_land = [ WardenEvent(x) for x in json["events_on_elevator_land"] ]
-        self.events_on_progress_exit_scan = [ WardenEvent(x) for x in json["events_on_progress_exit_scan"] ]
+class Expedition:
+    """Bundles regions, paths, and items together for one expedition"""
+
+    def __init__(self, data: Mapping[str, Any]):
+        """Creates an expedition from json"""
+
+        if not isinstance(data, dict):
+            raise TypeError("Expedition expects a dict")
+
+        self.name = data.get("name")
+        if not isinstance(self.name, str):
+            raise TypeError("'Expedition.name' must be a string")
+
+        raw_regions = data.get("regions")
+        if not isinstance(raw_regions, list):
+            raise TypeError("'Expedition.regions' must be a list")
+        self.regions = [ Region(r) for r in raw_regions ]
+
+        raw_locations = data.get("locations")
+        if not isinstance(raw_locations, list):
+            raise TypeError("'Expedition.locations' must be a list")
+        self.locations = [ Location(l) for l in raw_locations ]
+
+        raw_paths = data.get("paths")
+        if not isinstance(raw_paths, list):
+            raise TypeError("'Expedition.paths' must be a list")
+        self.paths = [ Path(p) for p in raw_paths ]
+
+        self.start_region = data.get("start_region")
+        if isinstance(self.start_region, numbers.Number):
+            self.start_region = int(self.start_region)
+        else:
+            raise TypeError("'Expedition.start_region' must be a number")
+
+        self.num_sectors = data.get("num_sectors")
+        if isinstance(self.num_sectors, numbers.Number):
+            self.num_sectors = int(self.num_sectors)
+        else:
+            raise TypeError("'Expedition.num_sectors' must be a number")
+
+    name: str
+    """Short or 'common' name of the expedition, ie R1A1"""
+
+    regions: List[Region]
+    """Regions found in this expedition"""
+
+    locations: List[Location]
+    """Locations found in this expedition"""
+
+    paths: List[Path]
+    """Paths found in this expedition"""
+
+    start_region: int
+    """Starting region for this expedition, linked to the menu"""
+
+    num_sectors: int
+    """Count of sectors (main, secondary, overload) in this expedition"""
 
 
 class ModdedInstanceData:
-    expeditions: List[ExpeditionData]
-    gear_names: List[str]
-    filler_items: List[WeightedItem]
-    trap_items: List[WeightedItem]
+    """Contains and formats modded instance data so it can be easily serialized / deserialized"""
 
-    def __init__(self, json: Dict[str, Any]):
-        self.expeditions = [ ExpeditionData(x) for x in json["expeditions"] ]
-        self.gear_names = [ str(x) for x in json["gear_names"] ]
-        self.filler_items = [ WeightedItem(x) for x in json["fillter_items"] ]
-        self.trap_items = [ WeightedItem(x) for x in json["trap_items"] ]
+    def __init__(self, data: Mapping[str, Any]):
+        """Creates a ModdedInstanceData from json"""
+
+        if not isinstance(data, dict):
+            raise TypeError("ModdedInstanceData expects a dict")
+
+        self.plugin_version = data.get("plugin_version")
+        if not isinstance(self.plugin_version, str):
+            raise TypeError("'ModdedInstanceData.plugin_version' must be a string")
+
+        if self.plugin_version != "1.0.0":
+            raise ValueError("Unsupported plugin version: %r" % (self.plugin_version,))
+
+        raw_expeditions = data.get("expeditions")
+        if not isinstance(raw_expeditions, list):
+            raise TypeError("'ModdedInstanceData.expeditions' must be a list")
+        self.expeditions = [ Expedition(e) for e in raw_expeditions ]
+
+        raw_optional_items = data.get("optional_items")
+        if not isinstance(raw_optional_items, list):
+            raise TypeError("'ModdedInstanceData.optional_items' must be a list")
+
+        def make_optional_category(item: Mapping[str, Any]) -> Tuple[str, List[str]]:
+            if not isinstance(item, dict):
+                raise TypeError("ModdedInstanceData.optional_items.item expects a dict")
+
+            category_name = item.get("Item1")
+            if not isinstance(category_name, str):
+                raise TypeError("ModdedInstanceData.optional_items.item.Item1 must be a string")
+
+            raw_items = item.get("Item2")
+            if not isinstance(raw_items, list):
+                raise TypeError("ModdedInstanceData.optional_items.item.Item2 must be a list")
+
+            items = [ str(i) if isinstance(i, str) else None for i in raw_items ]
+            if None in items:
+                raise TypeError("ModdedInstanceData.optional_items.item.Item2 must be a list of strings")
+
+        self.optional_items = [ make_optional_category(i) for i in raw_optional_items ]
+
+        raw_filler_items = data.get("filler_items")
+        if not isinstance(raw_filler_items, list):
+            raise TypeError("'ModdedInstanceData.filler_items' must be a list")
+        self.filler_items = [ WeightedItem(fi) for fi in raw_filler_items ]
+
+        raw_trap_items = data.get("trap_items")
+        if not isinstance(raw_trap_items, list):
+            raise TypeError("'ModdedInstanceData.trap_items' must be a list")
+        self.trap_items = [ WeightedItem(ti) for ti in raw_trap_items ]
+
+    plugin_version: str
+    """Version of the plugin which generated the ModdedInstanceData, for compatibility checking"""
+
+    expeditions: List[Expedition]
+    """List of expeditions declared by the data"""
+
+    optional_items: List[Tuple[str, List[str]]]
+    """List of optional item categories and the optional items in those categories"""
+
+    filler_items: List[WeightedItem]
+    """List of filler items supported by the plugin, weighted by how common they are (higher is more common)"""
+
+    trap_items: List[WeightedItem]
+    """List of trap items supported by the plugin, weighted by how bad they are (higher is worse)"""

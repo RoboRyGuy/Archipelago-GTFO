@@ -106,6 +106,7 @@ class GTFOOptions(PerGameCommonOptions):
     """Configuration options for GTFO randomization"""
 
     required_expeditions: RequiredExpeditions
+    require_all_objectives: RequireAllObjectives
     lock_expeditions: LockExpeditions
     lock_gear: LockGear
     starting_gear: StartingGear
