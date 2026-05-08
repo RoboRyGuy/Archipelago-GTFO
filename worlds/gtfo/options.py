@@ -12,6 +12,8 @@ class RequiredExpeditions(OptionSet):
     At least one expedition must be specified.
     """
     display_name = "Required Expeditions List"
+    rich_text_doc = True
+
     default = set([ "R1B1", "R1A1", "R8B2", "R1C1", "R8D1", "R8E1"])
     verify_item_name = False
     verify_location_name = False
@@ -21,12 +23,14 @@ class RequireSecondaries(Toggle):
     If true, winning requires clearing secondary (as well as main) on all selected expeditions
     """
     display_name = "Require Secondaries"
+    rich_text_doc = True
 
 class RequireOverloads(Toggle):
     """
     If true, winning requires clearing overload (as well as main) on all selected expeditions
     """
     display_name = "Require Overloads"
+    rich_text_doc = True
 
 class RandomizationWhitelist(OptionSet):
     """
@@ -41,17 +45,43 @@ class RandomizationBlacklist(OptionSet):
     Blacklist takes priority over the whitelist
     """
     display_name = "Randomization Blacklist"
+    rich_text_doc = True
 
-class EarlyItems(OptionList):
+class GTFOStartItems(OptionCounter):
     """
-    One item from each tag specified in this list will be added to first sphere items.
+    Items matching tags in this list will be added to the start inventory.
+    All items matching the tag are candidate; that is, using a parent tag will allow 
+     any child (or nested child) item to be added.
+    This will only work on items which both exist and are randomized.
+    """
+    display_name = "Start Items"
+    rich_text_doc = True
+
+
+class EarlyItems(OptionCounter):
+    """
+    Items matching tags in this list will be added to the first sphere.
+    All items matching the tag are candidate; that is, using a parent tag will allow 
+     any child (or nested child) item to be added.
+    This will only work on items which both exist and are randomized.
     """
     display_name = "Early Items"
+    rich_text_doc = True
 
 
 @dataclass
-class GTFOOptions(PerGameCommonOptions):
+class GTFOOptions(CommonOptions):
     """Configuration options for GTFO randomization"""
+    
+    local_items: LocalItems
+    non_local_items: NonLocalItems
+    start_items: GTFOStartItems ## CUSTOM, not default start invetory
+    start_hints: StartHints
+    start_location_hints: StartLocationHints
+    exclude_locations: ExcludeLocations
+    priority_locations: PriorityLocations
+    item_links: ItemLinks
+    plando_items: PlandoItems
 
     required_expeditions: RequiredExpeditions
     require_secondaries: RequireSecondaries
@@ -60,9 +90,8 @@ class GTFOOptions(PerGameCommonOptions):
     blacklist: RandomizationBlacklist
     early_items: EarlyItems
 
-
 gtfo_option_groups = [
-    OptionGroup("Main Conditions", [
+    OptionGroup("Goal Conditions", [
         RequiredExpeditions,
         RequireSecondaries,
         RequireOverloads
@@ -71,4 +100,15 @@ gtfo_option_groups = [
         RandomizationWhitelist,
         RandomizationBlacklist,
     ]),
+    OptionGroup("Common Options", [
+        LocalItems,         ## Need to customize this to use tags
+        NonLocalItems,      ## Need to customize this to use tags
+        GTFOStartItems,     
+        StartHints,         ## Need to customize this to use tags
+        StartLocationHints, ## Need to customize this to use tags
+        ExcludeLocations,   ## Need to customize this to use tags
+        PriorityLocations,  ## Need to customize this to use tags
+        ItemLinks,          ## Need to customize this to use tags
+        PlandoItems,        ## Need to customize this to use tags
+    ])
 ]
