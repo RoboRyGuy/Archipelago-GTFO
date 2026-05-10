@@ -11,7 +11,9 @@ The prefix `MID_` is added to classes in this file to prevent naming conflicts
 
 class LazyObject:
     """Base class which is just a dict with some helper accessors."""
-    __slots__ = ( "source" )
+    __slots__ = "source"
+
+    source: Mapping[str, Any]
 
     def __init__(self, source: Mapping[str, Any]):
         if not isinstance(source, Mapping):
@@ -162,6 +164,9 @@ class Mid_LocationData(LazyObject):
         """Currently one of 'Default', 'Priority', 'Excluded', or 'Trap'"""
         return self.get_value(str, "PriorityMode")
 
+    def get_is_empty(self) -> bool:
+        return self.get_value(bool, "IsEmpty")
+
 
 class Mid_Location(LazyObject):
     """Wraps an imported location"""
@@ -210,6 +215,9 @@ class Mid_ItemData(LazyObject):
 
     def get_is_deprioritized(self) -> bool:
         return self.get_value(bool, "IsDeprioritized")
+
+    def get_collected_by_default(self) -> bool:
+        return self.get_value(bool, "CollectedByDefault")
 
 
 class Mid_Item(LazyObject):

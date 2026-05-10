@@ -83,9 +83,11 @@ class Gen_Path():
 class Gen_LocationData():
 
     priority_mode: str
+    is_empty: bool
 
     def __init__(self, source: Mid_LocationData):
         self.priority_mode = source.get_priority_mode()
+        self.is_empty = source.get_is_empty()
 
     
 @dataclass(init=False, slots=True)
@@ -120,6 +122,7 @@ class Gen_ItemData():
     is_trap: bool
     do_skip_balancing: bool
     is_deprioritized: bool
+    collected_by_default: bool
 
     def __init__(self, source: Mid_ItemData):
         self.is_progression = source.get_is_progression()
@@ -128,6 +131,7 @@ class Gen_ItemData():
         self.is_trap = source.get_is_trap()
         self.do_skip_balancing = source.get_do_skip_balancing()
         self.is_deprioritized = source.get_is_deprioritized()
+        self.collected_by_default = source.get_collected_by_default()
 
     
 @dataclass(init=False, slots=True)

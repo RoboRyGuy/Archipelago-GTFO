@@ -47,17 +47,6 @@ class RandomizationBlacklist(OptionSet):
     display_name = "Randomization Blacklist"
     rich_text_doc = True
 
-class GTFOStartItems(OptionCounter):
-    """
-    Items matching tags in this list will be added to the start inventory.
-    All items matching the tag are candidate; that is, using a parent tag will allow 
-     any child (or nested child) item to be added.
-    This will only work on items which both exist and are randomized.
-    """
-    display_name = "Start Items"
-    rich_text_doc = True
-
-
 class EarlyItems(OptionCounter):
     """
     Items matching tags in this list will be added to the first sphere.
@@ -68,27 +57,27 @@ class EarlyItems(OptionCounter):
     display_name = "Early Items"
     rich_text_doc = True
 
+class GTFOStartInventory(OptionCounter):
+    """
+    Start inventory, specified as a list of tags. The requested number of
+    items matching the named tag will be removed from randomization and added
+    to the starting inventory. Relevant items must be randomized to be added.
+    """
+    display_name = "Start Inventory"
+    rich_text_doc = True
+
 
 @dataclass
-class GTFOOptions(CommonOptions):
+class GTFOOptions(PerGameCommonOptions):
     """Configuration options for GTFO randomization"""
     
-    local_items: LocalItems
-    non_local_items: NonLocalItems
-    start_items: GTFOStartItems ## CUSTOM, not default start invetory
-    start_hints: StartHints
-    start_location_hints: StartLocationHints
-    exclude_locations: ExcludeLocations
-    priority_locations: PriorityLocations
-    item_links: ItemLinks
-    plando_items: PlandoItems
-
     required_expeditions: RequiredExpeditions
     require_secondaries: RequireSecondaries
     require_overloads: RequireOverloads
     whitelist: RandomizationWhitelist
     blacklist: RandomizationBlacklist
     early_items: EarlyItems
+    start_items: GTFOStartInventory
 
 gtfo_option_groups = [
     OptionGroup("Goal Conditions", [
@@ -100,15 +89,4 @@ gtfo_option_groups = [
         RandomizationWhitelist,
         RandomizationBlacklist,
     ]),
-    OptionGroup("Common Options", [
-        LocalItems,         ## Need to customize this to use tags
-        NonLocalItems,      ## Need to customize this to use tags
-        GTFOStartItems,     
-        StartHints,         ## Need to customize this to use tags
-        StartLocationHints, ## Need to customize this to use tags
-        ExcludeLocations,   ## Need to customize this to use tags
-        PriorityLocations,  ## Need to customize this to use tags
-        ItemLinks,          ## Need to customize this to use tags
-        PlandoItems,        ## Need to customize this to use tags
-    ])
 ]
