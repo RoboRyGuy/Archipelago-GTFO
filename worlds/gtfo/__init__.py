@@ -1,7 +1,7 @@
 # world/gtfo/__init__.py
 
 import json
-from typing import cast, Set, Dict, Iterable, Callable, override, ClassVar, Type
+from typing import cast, Set, Dict, Iterable, Callable, override, ClassVar
 
 import rule_builder.rules
 from BaseClasses import Region, Location, Item, ItemClassification, LocationProgressType
@@ -101,7 +101,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
         ## Init class variables
         cls.class_logger = logging.getLogger(f"GTFO.{cls.game}")
         cls.tag_model_by_id = { tag.id: tag for tag in cls.gen_model.tags }
-        cls.tag_model_by_name = { tag.name: tag for tag in cls.gen_model.tags }
+        cls.tag_model_by_name = { tag.name.lower(): tag for tag in cls.gen_model.tags }
         cls.item_model_by_id = { item.id: item for item in cls.gen_model.items }
 
         cls.location_name_to_id = { cls.tag_model_by_id[loc.name_tag].name: loc.id for loc in cls.gen_model.locations }
@@ -150,7 +150,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
         def move_to_tag_set(dest: Set[int], source: Iterable[str], debug_name: str) -> None:
             """Helper which moves a list of tag names into a set"""
             for key in source:
-                tag = type(self).tag_model_by_name.get(key, None)
+                tag = type(self).tag_model_by_name.get(key.lower(), None)
                 if tag is None:
                     self.logger.error(f"Failed to find tag while parsing {debug_name}: {key}")
                     continue
@@ -159,18 +159,18 @@ class GTFOWorld(CachedRuleBuilderWorld):
         def move_to_tag_dict(dest: Dict[int, int], source: Mapping[str, int], debug_name: str) -> None:
             """Helper which moves a dict of string tag names into a dict of tag counts"""
             for key, value in source.items():
-                tag = type(self).tag_model_by_name.get(key, None)
+                tag = type(self).tag_model_by_name.get(key.lower(), None)
                 if tag is None:
                     self.logger.error(f"Failed to find tag while parsing {debug_name}: {key}")
                     continue
                 dest[tag.id] = (value if value is not None else 0)
 
         move_to_tag_set(self.whitelist_tags, self.options.whitelist.value, "whitelist_tags")
-        always_tag = type(self).tag_model_by_name.get("Always", None)
+        always_tag = type(self).tag_model_by_name.get("Always".lower(), None)
         if always_tag is not None: self.whitelist_tags.add(always_tag.id)
 
         move_to_tag_set(self.blacklist_tags, self.options.blacklist.value, "blacklist_tags")
-        always_tag = type(self).tag_model_by_name.get("Never", None)
+        always_tag = type(self).tag_model_by_name.get("Never".lower(), None)
         if always_tag is not None: self.blacklist_tags.add(always_tag.id)
 
         move_to_tag_dict(self.early_items, self.options.early_items.value, "early_items")
@@ -385,7 +385,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
 
         ## Checking to ensure at least one expedition is unlocked at game start
         unlock_tags = {
-            type(self).tag_model_by_name[f"{exp} Expedition Unlock"].id for exp in self.required_expeditions
+            type(self).tag_model_by_name[f"{exp} Expedition Unlock".lower()].id for exp in self.required_expeditions
         }
         if all(self.tags_listed_default(tag) for tag in unlock_tags):
             start_tags = {key for key, value in self.start_inventory.items() if value is not None and value > 0}
@@ -393,7 +393,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
                 self.logger.warning(
                     "Detected that all expeditions are locked. Randomly picking one starting expedition."
                 )
-                self.start_inventory[type(self).tag_model_by_name["Expedition Unlock Items"].id] = 1
+                self.start_inventory[type(self).tag_model_by_name["Expedition Unlock Items".lower()].id] = 1
 
         def claim_by_tags(requested_tags: Mapping[int, int], callback: Callable[[Gen_Item], None], debug_name: str):
             """Claims items by ID from the randomization list and calls the provided callback"""
@@ -499,9 +499,9 @@ class GTFOWorld(CachedRuleBuilderWorld):
         ## Win Condition
 
         ## Set the tags so we can filter by tag for relevant goal items
-        wl = { type(self).tag_model_by_name["Goal Items"].id } ## By default, all goal items
+        wl = { type(self).tag_model_by_name["Goal Items".lower()].id } ## By default, all goal items
         bl = { ## Blacklist all goal items for expeditions we're not completing
-            type(self).tag_model_by_name[f"{exp.name} Goal Items"].id for exp in self.gen_model.expeditions
+            type(self).tag_model_by_name[f"{exp.name} Goal Items".lower()].id for exp in self.gen_model.expeditions
                 if exp.name not in self.required_expeditions 
         }
 
@@ -509,13 +509,13 @@ class GTFOWorld(CachedRuleBuilderWorld):
 
             if not self.options.require_secondaries:
                 tag_name = f"{exp} (Secondary) Sector Clear"
-                tag = self.tag_model_by_name.get(tag_name, None)
+                tag = self.tag_model_by_name.get(tag_name.lower(), None)
                 if tag is not None:
                     bl.add(tag.id)
 
             if not self.options.require_overloads:
                 tag_name = f"{exp} (Overload) Sector Clear"
-                tag = self.tag_model_by_name.get(tag_name, None)
+                tag = self.tag_model_by_name.get(tag_name.lower(), None)
                 if tag is not None:
                     bl.add(tag.id)
 
