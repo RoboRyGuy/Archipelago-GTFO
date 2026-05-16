@@ -8,13 +8,12 @@ class RequiredExpeditions(OptionSet):
     The expeditions to use for randomization, specified by name.
     The special name \"ALL\" can be used to select all available
      expeditions, though this is not recommended.
-    The expeditions will be hinted to appear in the order listed.
     At least one expedition must be specified.
     """
     display_name = "Required Expeditions List"
     rich_text_doc = True
 
-    default = set([ "R1B1", "R1A1", "R8B2", "R1C1", "R8D1", "R8E1"])
+    default = {"R1B1", "R3A2", "R6BX", "R6D2", "R7C1", "R8C2"}
     verify_item_name = False
     verify_location_name = False
 
@@ -38,6 +37,7 @@ class RandomizationWhitelist(OptionSet):
     Nothing randomizes by default; it must be whitelisted.
     """
     display_name = "Randomization Whitelist"
+    default = { "All" }
 
 class RandomizationBlacklist(OptionSet):
     """
@@ -46,6 +46,7 @@ class RandomizationBlacklist(OptionSet):
     """
     display_name = "Randomization Blacklist"
     rich_text_doc = True
+    default = { "All Scans", "All Warps" }
 
 class EarlyItems(OptionCounter):
     """
@@ -56,6 +57,7 @@ class EarlyItems(OptionCounter):
     """
     display_name = "Early Items"
     rich_text_doc = True
+    default = { "Expedition Unlock Items": 1 }
 
 class GTFOStartInventory(OptionCounter):
     """
@@ -65,19 +67,36 @@ class GTFOStartInventory(OptionCounter):
     """
     display_name = "Start Inventory"
     rich_text_doc = True
+    default = {
+        "Expedition Unlock Items": 1,
+        "Unlock Lobby Slot Items": 1,
+        "Melee Gear Items": 1,
+        "Primary Gear Items": 1,
+        "Special Gear Items": 1,
+        "Tool Gear Items": 1
+    }
 
 
 @dataclass
-class GTFOOptions(PerGameCommonOptions):
+class GTFOOptions(CommonOptions):
     """Configuration options for GTFO randomization"""
-    
+
+    local_items: LocalItems                  ## TODO
+    non_local_items: NonLocalItems           ## TODO
+    start_inventory: GTFOStartInventory
+    start_hints: StartHints                  ## TODO
+    start_location_hints: StartLocationHints ## TODO
+    exclude_locations: ExcludeLocations      ## TODO
+    priority_locations: PriorityLocations    ## TODO
+    item_links: ItemLinks                    ## TODO
+    plando_items: PlandoItems                ## TODO
+
     required_expeditions: RequiredExpeditions
     require_secondaries: RequireSecondaries
     require_overloads: RequireOverloads
     whitelist: RandomizationWhitelist
     blacklist: RandomizationBlacklist
     early_items: EarlyItems
-    start_items: GTFOStartInventory
 
 gtfo_option_groups = [
     OptionGroup("Goal Conditions", [
