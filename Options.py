@@ -1076,7 +1076,10 @@ class OptionSet(Option[typing.Set[str]], VerifyKeys):
 
     @classmethod
     def get_option_name(cls, value):
-        return ", ".join(sorted(value))
+        try:
+            return ", ".join(sorted(value))
+        except:
+            print("Error")
 
     def __contains__(self, item):
         return item in self.value

@@ -1,5 +1,5 @@
 
-from typing import Any, List, Mapping, Optional, Union, Type, TypeVar, get_origin, get_args
+from typing import Any, List, Mapping, Optional, Union, Type, TypeVar, cast, get_origin, get_args
 
 T = TypeVar("T")
 """Type variable used for conversions"""
@@ -21,12 +21,12 @@ class LazyObject:
         self.source = source
 
     @staticmethod
-    def convert(typ: Type[T], value: Any) -> Type[T]:
+    def convert(typ: Type[T], value: Any) -> T:
         """
         Helper to try and convert one value into another
         """
         allow_fail = False
-        if get_origin(typ) is Union:
+        if get_origin(typ) is Union: ## Assuming the Union is an Optional
             typ = get_args(typ)[0]
             allow_fail = True
 
@@ -43,7 +43,7 @@ class LazyObject:
                 f"Failed to convert value {value!r} to type {typ}: {exc}"
             ) from exc
 
-    def get_value(self, typ: Type[T], *keys: str) -> Optional[Type[T]]:
+    def get_value(self, typ: Type[T], *keys: str) -> T:
         """
         Look up the first matching key in `source`, then convert the value to `typ`.
         Returns None if no key is found.
@@ -55,7 +55,7 @@ class LazyObject:
             raise KeyError(f"Failed to find key(s): {keys}")
             return None
 
-    def get_list(self, typ: Type[T], *keys: str) -> List[Type[T]]:
+    def get_list(self, typ: Type[T], *keys: str) -> List[T]:
         """
         Look up the first matching key in `source`, then convert the value to `typ`.
         Returns an empty list if no key is found.
@@ -253,10 +253,39 @@ class Mid_Item(LazyObject):
         """
         return self.get_value(Optional[str], "RequiredExpeditionName")
 
+class Mid_Option(LazyObject):
+    """Wraps an imported option"""
+    __slots__ = LazyObject.__slots__
+
+    def get_type(self) -> str:
+        return self.get_value(str, "Type")
+
+    def get_name(self) -> str:
+        return self.get_value(str, "Name")
+
+    def get_category(self) -> str:
+        return self.get_value(str, "Category")
+
+    def get_description(self) -> str:
+        return self.get_value(str, "Description")
+
+    def get_default_value(self) -> str:
+        return self.get_value(str, "DefaultValue")
+
+    def get_choices(self) -> Mapping[str, Mapping[str, List[int]]]:
+        """
+        The choices mapping. The first key is the selected choice; the second is
+        the category affect; the final list is the tag effect
+        """
+        return self.source["Choices"] ## No conversions required; we're relying on it working
+
 
 class Mid_GameData(LazyObject):
     """Wraps all data imported from GTFO"""
     __slots__ = LazyObject.__slots__
+
+    def get_name(self) -> Optional[str]:
+        return self.get_value(Optional[str], "Name")
 
     def get_expeditions(self) -> List[Mid_ExpeditionData]: 
         return self.get_list(Mid_ExpeditionData, "Expeditions")
@@ -278,6 +307,9 @@ class Mid_GameData(LazyObject):
 
     def get_floating_items(self) -> List[int]:
         return self.get_list(int, "FloatingItems")
+
+    def get_options(self) -> List[Mid_Option]:
+        return self.get_list(Mid_Option, "Options")
     
 
 

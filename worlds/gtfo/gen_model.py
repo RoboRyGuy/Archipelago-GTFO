@@ -112,6 +112,9 @@ class Gen_Location():
         self.owning_regions = source.get_owning_regions()
         self.is_randomized = False
 
+    def __hash__(self):
+        return hash(f"Location {self.id}")
+
     
 @dataclass(init=False, slots=True)
 class Gen_ItemData():
@@ -156,10 +159,32 @@ class Gen_Item():
         self.required_expedition = source.get_required_expedition()
         self.is_randomized = False
 
+    def __hash__(self):
+        return hash(f"Item {self.id}")
+
+
+@dataclass(init=False, slots=True)
+class Gen_Option():
+    type: str
+    name: str
+    category: str
+    description: str
+    default_value: str
+    choices: Mapping[str, Mapping[str, List[int]]]
+
+    def __init__(self, source: Mid_Option):
+        self.type = source.get_type()
+        self.name = source.get_name()
+        self.category = source.get_category()
+        self.description = source.get_description()
+        self.default_value = source.get_default_value()
+        self.choices = source.get_choices()
+
     
 @dataclass(init=False, slots=True)
 class Gen_GameData():
 
+    name: Optional[str]
     expeditions: List[Gen_ExpeditionData]
     tags: List[Gen_Tag]
     regions: List[Gen_Region]
@@ -167,12 +192,15 @@ class Gen_GameData():
     locations: List[Gen_Location]
     items: List[Gen_Item]
     floating_items: List[int]
+    options: List[Gen_Option]
 
     def __init__(self, source: Mid_GameData):
+        self.name           = source.get_name()
         self.expeditions    = [ Gen_ExpeditionData(x) for x in source.get_expeditions() ]
         self.tags           = [ Gen_Tag(x)            for x in source.get_tags() ]
         self.regions        = [ Gen_Region(x)         for x in source.get_regions() ]
         self.paths          = [ Gen_Path(x)           for x in source.get_paths() ]
         self.locations      = [ Gen_Location(x)       for x in source.get_locations() ]
         self.items          = [ Gen_Item(x)           for x in source.get_items() ]
-        self.floating_items = source.get_floating_items() 
+        self.floating_items = source.get_floating_items()
+        self.options        = [ Gen_Option(x)         for x in source.get_options() ]
