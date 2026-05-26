@@ -9,7 +9,7 @@ import json
 import logging
 from pathlib import Path
 import settings
-from typing import Set, Dict, Iterable, Callable, override, ClassVar
+from typing import Any, Callable, cast, ClassVar, Dict, Iterable, List, Mapping, Optional, override, Set, Type, Union
 from types import SimpleNamespace
 import Utils
 
@@ -19,8 +19,9 @@ from rule_builder.cached_world import CachedRuleBuilderWorld
 from rule_builder.rules import Rule, And, Or, Has, HasGroup, CanReachRegion, HasAll, False_
 
 from .options import GTFOOptions
-from .mid_model import *
-from .gen_model import *
+from .model import Gen_GameData, Gen_ExpeditionData, Gen_Tag, Gen_Region, Gen_Path, Gen_ReqItem, \
+                    Gen_Location, Gen_LocationData, Gen_Item, Gen_ItemData
+from pydantic import ValidationError
 
 class GTFOLocation(Location):
     game: str = "GTFO"
@@ -100,7 +101,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
     #start_inventory: Mapping[int, int]
     """Tags and counts for items to place in our starting inventory. Removed because we make Archipelago handle this"""
     #start_hints: Mapping[int, int]
-    """Tags and counts for items and locations which start hinted. Removed because we make Archieplago handle this."""
+    """Tags and counts for items and locations which start hinted. Removed because we make Archipelago handle this."""
     exclude_locations: Set[int]
     """Tags for locations to override and mark as excluded"""
     priority_locations: Set[int]
@@ -867,13 +868,13 @@ class GTFOWorldBuilder:
         ## Attempt to find and load data from file
         try:
             with world_file.open("r") as file_data:
-                loaded_mid_model = Mid_GameData(json.load(file_data))
-                world_class.gen_model = Gen_GameData(loaded_mid_model)
-                del loaded_mid_model
+                world_class.gen_model = Gen_GameData.model_validate_json(file_data.read())
         except OSError as e: ## Failed to open file
             raise Exception(f"Failed to find GTFO MID file for game: {world_name}") from e
         except json.JSONDecodeError as e: ## JSON parsing failed
             raise Exception(f"Failed to parse GTFO MID file for game: {world_name}") from e
+        except ValidationError as e: ## pydantic failed to validate data
+            raise Exception(f"Failed to validate GTFO MID file for game: {world_name}") from e
         except Exception as e: ## Generic failure during gen_model instantiation
             raise Exception(f"Malformed GTFO MID file for game: {world_name}") from e
 
