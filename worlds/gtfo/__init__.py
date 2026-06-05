@@ -8,19 +8,19 @@ import itertools
 import json
 import logging
 from pathlib import Path
-import settings
-from typing import Any, Callable, cast, ClassVar, Dict, Iterable, List, Mapping, Optional, override, Set, Type, Union
+from typing import Any, cast, ClassVar, Dict, Iterable, List, Mapping, Optional, override, Set, Tuple, Type, Union
 from types import SimpleNamespace
 import Utils
 
 import Options
 from BaseClasses import Region, Location, Item, ItemClassification, LocationProgressType
 from rule_builder.cached_world import CachedRuleBuilderWorld
-from rule_builder.rules import Rule, And, Or, Has, HasGroup, CanReachRegion, HasAll, False_
+from rule_builder.rules import Rule, And, Or, Has, HasGroup, CanReachRegion, HasFromList, False_
 
-from .options import GTFOOptions
-from .model import Gen_GameData, Gen_ExpeditionData, Gen_Tag, Gen_Region, Gen_Path, Gen_ReqItem, \
-                    Gen_Location, Gen_LocationData, Gen_Item, Gen_ItemData
+from .options import GTFOOptions, OptionEvaluationState
+from .model import GameDataModel, ExpeditionDataModel, TagModel, RegionModel, PathModel, ReqItemModel, \
+                    LocationModel, LocationDataModel, ItemModel, ItemDataModel, \
+                    OptionBaseModel, OptionInputModel
 from pydantic import ValidationError
 
 class GTFOLocation(Location):
@@ -35,10 +35,6 @@ class GTFOWorld(CachedRuleBuilderWorld):
     created on-demand using AutoWorldRegister (see bottom of file)
     """
 
-    class GTFOSettings(settings.Group):
-        """Settings class for GTFO (unused)"""
-        game: ClassVar[str] ## Overwritten when created
-
     ## Constants
     origin_region_name: str = "Menu"
     """Name of the origin region. Same as the default."""
@@ -50,18 +46,21 @@ class GTFOWorld(CachedRuleBuilderWorld):
     """Indicates the regions of this game correspond to actual physical locations (which is mostly true)"""
     options_dataclass: ClassVar[GTFOOptions]
     """The dataclass to use for this world. This will be set from MID data."""
+
     _options: GTFOOptions
     """Actual options instance for this world"""
+
     @property
     def options(self) -> GTFOOptions:
         """Options getter; required because we need to react to set operations"""
         return self._options
+
     @options.setter
     def options(self, value: GTFOOptions):
         """Options setter, used to update internal state when the options are set/changed"""
         self._options = value
         self.setup_from_options()
-    """Actual options instance. This will be populated by Archipelago using the overwritten dataclass above."""
+
     location_name_to_id: ClassVar[Dict[str, int]]
     """Map of location names to location IDs. This will be populated from MID data"""
     item_name_to_id: ClassVar[Dict[str, int]]
@@ -74,24 +73,26 @@ class GTFOWorld(CachedRuleBuilderWorld):
     ## Class variables
     class_logger: ClassVar[logging.Logger]
     """Logger for the class (world)"""
-    option_effects: ClassVar[List[Mapping[Any, Mapping[str, List[int]]]]]
-    """One mapping per options. Maps option value to effect. Effect is a map of effect type to a list of tags."""
+    gen_model: ClassVar[GameDataModel]
+    """Imported MID data"""
+    tag_model_by_id: ClassVar[Mapping[int, TagModel]]
+    """Tag lookup via ID"""
+    tag_model_by_name: ClassVar[Mapping[str, TagModel]]
+    """Tag lookup via name"""
+    item_model_by_id: ClassVar[Mapping[int, ItemModel]]
+    """Item lookup by id"""
+    empty_item_model: ClassVar[ItemModel]
+    """Default filler item which does nothing. To be replaced with filler items in future update"""
+    option_model_by_id: ClassVar[Mapping[int, OptionBaseModel]]
+    """Option model lookup used for options evaluation"""
     option_groups: ClassVar[List[Options.OptionGroup]]
     """List of generated option groups for the option dataclass"""
-    gen_model: ClassVar[Gen_GameData]
-    """Imported MID data"""
-    tag_model_by_id: ClassVar[Mapping[int, Gen_Tag]]
-    """Tag lookup via ID"""
-    tag_model_by_name: ClassVar[Mapping[str, Gen_Tag]]
-    """Tag lookup via name"""
-    item_model_by_id: ClassVar[Mapping[int, Gen_Item]]
-    """Item lookup by id"""
-    empty_item_model: ClassVar[Gen_Item]
-    """Default filler item which does nothing. To be replaced with filler items in future update"""
 
     ## Per-player variables
     logger: logging.Logger
     """Logger for the world instance, ie one per player"""
+    start_vouchers: Dict[int, int]
+    """Dict of (tag, count) of items to pull prior to randomization and add to the starting inventory"""
     early_items: Dict[int, int]
     """Dict of (tag, count) of items to set as early"""
     #local_items: Set[int]
@@ -106,11 +107,11 @@ class GTFOWorld(CachedRuleBuilderWorld):
     """Tags for locations to override and mark as excluded"""
     priority_locations: Set[int]
     """Tags for locations to override and mark as priorities"""
-    goal_blacklist: Set[int]
+    goal_blacklist: Dict[int, int]
     """Tag blacklist for goal items. The whitelist is all goal items"""
     reachable_regions: Set[int]
     """The set of region IDs that can be reached using the provided settings"""
-    reachable_locations: Set[Gen_Location]
+    reachable_locations: Set[LocationModel]
     """The set of location IDs fully contained within reachable_regions"""
 
     ## Slot data
@@ -122,10 +123,14 @@ class GTFOWorld(CachedRuleBuilderWorld):
     """Whitelist tags for testing randomization of locations and items"""
     blacklist_tags: Set[int]
     """Blacklist tags for testing randomization of locations and items"""
-    filled_empty_locations: List[int]
+    filled_empty_locations: List[Tuple[int, int]]
     """List of empty locations that were filled with a floating item during generation"""
     goal_items: List[int]
     """List of items required to reach the goal"""
+    skippable_goal_count: int
+    """Number of goal items which can be skipped"""
+    fail_if_insufficient_empty_locations: bool
+    """If true, raise an exception if there are insufficient empty locations for the selected floating items"""
 
     ## Universal Tracker integration
     ut_can_gen_without_yaml: ClassVar[bool] = True
@@ -154,6 +159,8 @@ class GTFOWorld(CachedRuleBuilderWorld):
         self.required_expeditions = self.options.required_expeditions.value.copy()
         if "All" in self.required_expeditions:
             self.required_expeditions = { e.name for e in self.gen_model.expeditions }
+        self.skippable_goal_count = self.options.skippable_goal_count.value
+        self.fail_if_insufficient_empty_locations = self.options.fail_if_insufficient_empty_locations.value != 0
 
         ## Universal Tracker integration
         re_gen_passthrough = getattr(self.multiworld, "re_gen_passthrough", {})
@@ -161,6 +168,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
             slot_data: Dict[str, Any] = re_gen_passthrough[self.game]
             self.root_seed = slot_data["RootSeed"]
             self.required_expeditions = slot_data["ExpeditionNames"]
+            self.skippable_goal_count = slot_data["SkippableGoalCount"]
 
         ## Enforces consistency between UT and non-UT
         self.random.seed(self.root_seed)
@@ -171,7 +179,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
         self.reachable_regions = set()
         for e_name in self.required_expeditions:
             if e_name is None: continue
-            e: Optional[Gen_ExpeditionData] = expedition_lookup.get(e_name)
+            e: Optional[ExpeditionDataModel] = expedition_lookup.get(e_name)
             if e is None:
                 not_found_expeditions.append(e_name)
             else:
@@ -190,13 +198,17 @@ class GTFOWorld(CachedRuleBuilderWorld):
         #######################################################################
         ## Import user options as tags
 
-        not_found_tags: Dict[str, List[str]] = dict()
+        oe_state = OptionEvaluationState()
+        oe_state.world = self
+        oe_state.started_ids = set()
+        oe_state.evaluated_ids = set()
+        oe_state.not_found_tags = dict()
         def move_to_tag_set(dest: Set[int], source: Iterable[str], debug_name: str) -> None:
             """Helper which moves a list of tag names into a set"""
             for key in source:
                 found_tag = type(self).tag_model_by_name.get(key.lower(), None)
                 if found_tag is None:
-                    not_found_tags.setdefault(debug_name, []).append(key)
+                    oe_state.not_found_tags.setdefault(debug_name, []).append(key)
                 else:
                     dest.add(found_tag.id)
 
@@ -205,7 +217,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
             for key, value in source.items():
                 found_tag = type(self).tag_model_by_name.get(key.lower(), None)
                 if found_tag is None:
-                    not_found_tags.setdefault(debug_name, []).append(key)
+                    oe_state.not_found_tags.setdefault(debug_name, []).append(key)
                 else:
                     dest[found_tag.id] = (value if value is not None else 0)
 
@@ -222,17 +234,20 @@ class GTFOWorld(CachedRuleBuilderWorld):
         self.early_items = dict()
         move_to_tag_dict(self.early_items, self.options.early_items.value, "early_items")
 
-        local_items: Set[int] = set()
-        move_to_tag_set(local_items, self.options.gtfo_local_items.value, "local_items")
+        self.start_vouchers = dict()
+        move_to_tag_dict(self.start_vouchers, self.options.start_vouchers.value, "start_vouchers")
 
-        non_local_items: Set[int] = set()
-        move_to_tag_set(non_local_items, self.options.gtfo_non_local_items.value, "non_local_items")
+        oe_state.local_items = set()
+        move_to_tag_set(oe_state.local_items, self.options.gtfo_local_items.value, "local_items")
 
-        start_inventory: Dict[int, int] = dict()
-        move_to_tag_dict(start_inventory, self.options.gtfo_start_inventory.value, "start_inventory")
+        oe_state.non_local_items = set()
+        move_to_tag_set(oe_state.non_local_items, self.options.gtfo_non_local_items.value, "non_local_items")
 
-        start_hints: Dict[int, int] = dict()
-        move_to_tag_dict(start_hints, self.options.gtfo_start_hints.value, "start_hints")
+        oe_state.start_inventory = dict()
+        move_to_tag_dict(oe_state.start_inventory, self.options.gtfo_start_inventory.value, "start_inventory")
+
+        oe_state.start_hints = dict()
+        move_to_tag_dict(oe_state.start_hints, self.options.gtfo_start_hints.value, "start_hints")
 
         self.exclude_locations = set()
         move_to_tag_set(self.exclude_locations, self.options.gtfo_exclude_locations.value, "exclude_locations")
@@ -240,11 +255,15 @@ class GTFOWorld(CachedRuleBuilderWorld):
         self.priority_locations = set()
         move_to_tag_set(self.priority_locations, self.options.gtfo_priority_locations.value, "priority_locations")
 
-        self.goal_blacklist = set()
-        move_to_tag_set(self.goal_blacklist, self.options.goal_blacklist.value, "goal_blacklist")
+        self.goal_blacklist = dict()
+        move_to_tag_dict(self.goal_blacklist, self.options.goal_blacklist.value, "goal_blacklist")
+
+        ## Evaluate options
+        for option in self.option_model_by_id.values():
+            oe_state.evaluate(option)
 
         ## Report badly-formatted (or erroneous) expedition names and tag names
-        if not_found_expeditions or not_found_tags:
+        if not_found_expeditions or oe_state.not_found_tags:
             error_message: str = f"YAML file parsing failed for player: {self.multiworld.get_player_name(self.player)}"
 
             ## Expedition checking
@@ -260,7 +279,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
 
             ## Tag checking
             tag_choices = self.tag_models.keys()
-            for option_name, tags in not_found_tags:
+            for option_name, tags in oe_state.not_found_tags:
                 error_message += f"Failed to find {len(tags)} tags in setting {option_name}."
                 for t_name in tags:
                     match = Utils.get_fuzzy_results(t_name, tag_choices, 1)
@@ -271,62 +290,33 @@ class GTFOWorld(CachedRuleBuilderWorld):
 
             raise Exception(error_message)
 
-        for i in range(len(type(self).option_effects)):
-            option = self.options.__dict__[f"option_{i}"]
-            effect = type(self).option_effects[i][option.value]
-            for effect_type, tags in effect.items():
-                if effect_type == "": ## So I can use elif for all the options (so it's ~pretty~)
-                    raise Exception()
-                elif effect_type == "Whitelist":
-                    self.whitelist_tags.update(tags)
-                elif effect_type == "Blacklist":
-                    self.blacklist_tags.update(tags)
-                elif effect_type == "StartInventory":
-                    for tag in tags: start_inventory[tag] = start_inventory.get(tag, 0) + 1
-                elif effect_type == "EarlyItems":
-                    for tag in tags: self.early_items[tag] = self.early_items.get(tag, 0) + 1
-                elif effect_type == "LocalItems":
-                    local_items.update(tags)
-                elif effect_type == "NonLocalItems":
-                    non_local_items.update(tags)
-                elif effect_type == "StartHints":
-                    for tag in tags: start_hints[tag] = start_hints.get(tag, 0) + 1
-                elif effect_type == "CustomExcludeLocations":
-                    self.exclude_locations.update(tags)
-                elif effect_type == "CustomPriorityLocations":
-                    self.priority_locations.update(tags)
-                elif effect_type == "GoalBlacklist":
-                    self.goal_blacklist.update(tags)
-                else:
-                    raise Exception(f"Unsupported option effect: {effect_type}")
-
         ## Overwrite the settings we don't control so we can pass them off to Archipelago
         local_items_setting = options.LocalItems([
             self.tag_model_by_id[item.name_tag].name for item in type(self).gen_model.items
             if item.required_expedition in self.required_expeditions
-            and type(self).tags_listed(item.name_tag, item.tag2, item.tag3, wl=local_items, bl=set())
+            and type(self).tags_match(*item.tags(), tag_set=oe_state.local_items)
         ])
         nonlocal_items_setting = options.NonLocalItems([
             self.tag_model_by_id[item.name_tag].name for item in type(self).gen_model.items
             if item.required_expedition in self.required_expeditions
-            and type(self).tags_listed(item.name_tag, item.tag2, item.tag3, wl=non_local_items, bl=set())
+            and type(self).tags_match(*item.tags(), tag_set=oe_state.non_local_items)
         ])
         start_inventory_setting = options.StartInventory({
             self.tag_model_by_id[key.name_tag].name: value for key, value
-            in self.sample_items(start_inventory, True, "Start Inventory").items()
+            in self.sample_items(oe_state.start_inventory, True, "Start Inventory").items()
         })
         start_hints_results = self.sample_items(
-            start_hints, True, "Start Hints",
-            list(itertools.chain[Gen_Location | Gen_Item](
+            oe_state.start_hints, True, "Start Hints",
+            list(itertools.chain[LocationModel | ItemModel](
                 (i for i in type(self).gen_model.items if i.required_expedition in self.required_expeditions),
                 (l for l in self.reachable_locations)
             ))
         )
         start_item_hints = Options.StartHints([
-            self.tag_model_by_id[entity.name_tag].name for entity in start_hints_results if entity is Gen_Item
+            self.tag_model_by_id[entity.name_tag].name for entity in start_hints_results if entity is ItemModel
         ])
         start_location_hints = Options.StartLocationHints([
-            self.tag_model_by_id[entity.name_tag].name for entity in start_hints_results if entity is Gen_Location
+            self.tag_model_by_id[entity.name_tag].name for entity in start_hints_results if entity is LocationModel
         ])
 
         ## Spoof the options class so Archipelago doesn't throw errors
@@ -366,27 +356,35 @@ class GTFOWorld(CachedRuleBuilderWorld):
         #######################################################################
         ## Locations and Items Init
 
-        ## Fetch and set randomization on relevant locations
-        for loc in self.reachable_locations:
-            loc.is_randomized = self.tags_listed_default(loc.name_tag, loc.tag2, loc.tag3)
-            if loc.is_randomized and loc.rand_data.is_empty:
-                loc.item_id = 0 ## In case we accidentally pull used data
+        ## Reset locations and items (since the model is reused between players)
+        for gen_loc in type(self).gen_model.locations:
+            gen_loc.is_in_required_expeditions = gen_loc.is_whitelisted = gen_loc.is_blacklisted = False
+            if gen_loc.rand_data.is_empty:
+                gen_loc.item_id = 0
+        for gen_item in type(self).gen_model.items:
+            gen_item.is_in_required_expeditions = gen_item.is_whitelisted = gen_item.is_blacklisted = False
+
+        ## Set randomization on relevant locations
+        for gen_loc in self.reachable_locations:
+            gen_loc.is_in_required_expeditions = True
+            gen_loc.is_whitelisted = type(self).tags_match(*gen_loc.tags(), tag_set=self.whitelist_tags)
+            gen_loc.is_blacklisted = type(self).tags_match(*gen_loc.tags(), tag_set=self.blacklist_tags)
 
         ## Set randomization on relevant items - we won't really be referencing the relevant item set after this
         relevant_item_ids = { loc.item_id for loc in self.reachable_locations if loc.item_id != 0 }
         relevant_item_ids.update(self.gen_model.floating_items)
         for item_id in relevant_item_ids:
             gen_item = self.item_model_by_id[item_id]
-            gen_item.is_randomized = \
-                gen_item.required_expedition in self.required_expeditions \
-                and self.tags_listed_default(gen_item.name_tag, gen_item.tag2, gen_item.tag3)
+            gen_item.is_in_required_expeditions = gen_item.required_expedition in self.required_expeditions
+            gen_item.is_whitelisted = type(self).tags_match(*gen_item.tags(), tag_set=self.whitelist_tags)
+            gen_item.is_blacklisted = type(self).tags_match(*gen_item.tags(), tag_set=self.blacklist_tags)
 
         #######################################################################
         ## Floating Item Distribution
 
         self.filled_empty_locations = list()
         floating_items: List[int] = []
-        def distribute(empty_locations: List[Gen_Location]) -> None:
+        def distribute(empty_locations: List[LocationModel]) -> None:
             """Helper to distribute currently queued floating items into available empty locations"""
             if not floating_items: ## Must have at least one floating item to distribute
                 return
@@ -404,20 +402,20 @@ class GTFOWorld(CachedRuleBuilderWorld):
                     index = (i + abs(self.root_seed)) % len(empty_locations)
                     if empty_locations[index].item_id != 0:
                         raise Exception("Overwriting floating item ID. I messed up somewhere!")
-                    empty_locations[index].item_id = floating_items.pop(0)
+                    empty_locations[index].item_id = floating_items.pop()
                     accum -= 1.0
-                    self.filled_empty_locations.append(empty_locations[index].id)
+                    self.filled_empty_locations.append((empty_locations[index].id, empty_locations[index].item_id))
 
         ## Round 1: Progression items into priority locations
         floating_items = [ 
             i for i in self.gen_model.floating_items 
-            if self.item_model_by_id[i].is_randomized
+            if self.item_model_by_id[i].should_be_randomized()
             and self.item_model_by_id[i].rand_data.is_progression
         ]
         seen_items = { f for f in floating_items }
         distribute([
             l for l in self.reachable_locations
-            if l.is_randomized and l.item_id == 0
+            if l.should_be_randomized() and l.item_id == 0
             and (
                 (l.rand_data.priority_mode == "Priority" and l.id not in self.exclude_locations)
                 or l.id in self.priority_locations
@@ -427,7 +425,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
         ## Round 2: Progression items in all locations
         distribute([
             l for l in self.reachable_locations
-            if l.is_randomized and l.item_id == 0
+            if l.should_be_randomized() and l.item_id == 0
             and (
                 (l.rand_data.priority_mode != "Excluded" and l.id not in self.exclude_locations)
                 or l.id in self.priority_locations
@@ -437,15 +435,20 @@ class GTFOWorld(CachedRuleBuilderWorld):
         ## Round 3: All items into all locations
         floating_items.extend(
             i for i in self.gen_model.floating_items 
-            if self.item_model_by_id[i].is_randomized
+            if self.item_model_by_id[i].should_be_randomized()
             and not i in seen_items
         )
         distribute([
             l for l in self.reachable_locations
-            if l.is_randomized and l.item_id == 0
+            if l.should_be_randomized() and l.item_id == 0
         ])
 
-        ## Round 4: All remaining items are given
+        ## Round 4: All remaining items are given (or raise an exception)
+        if len(floating_items) > 0 and self.fail_if_insufficient_empty_locations:
+            raise Exception(
+                f"Insufficient empty locations! There are {len(floating_items)} unplaced floating items"
+                + "\nConsider adding more expeditions or, if possible, enabling more empty locations."
+            )
         for i in floating_items:
             name = self.tag_model_by_id[self.item_model_by_id[i].name_tag].name
             self.logger.warning(f"Not enough empty locations. Adding starting item: {name}")
@@ -453,8 +456,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
         
         #######################################################################
         ## Item Creation and Submission
-        
-        rand_items: List[Gen_Item] = []
+        rand_items: List[ItemModel] = []
         for gen_location in self.reachable_locations:
             ## Any location still empty is ignored!
             if gen_location.item_id == 0:
@@ -494,66 +496,43 @@ class GTFOWorld(CachedRuleBuilderWorld):
 
             ## Either pair them together or randomize them!
             gen_item = self.item_model_by_id[gen_location.item_id]
-            if gen_location.is_randomized and gen_item.is_randomized:
+            is_randomized = True \
+                and gen_location.is_in_required_expeditions and gen_item.is_in_required_expeditions \
+                and (gen_location.is_whitelisted or gen_item.is_whitelisted) \
+                and not (gen_location.is_blacklisted or gen_item.is_blacklisted)
+            if is_randomized:
                 rand_items.append(gen_item)
                 item_tag = self.tag_model_by_id[gen_item.name_tag]
                 self.logger.debug(f"Randomized: {location.name} - {item_tag.name}")
             else:
-                item = self.create_item_by_model(gen_item, True)
-                location.address = None
+                item = self.create_item_by_model(gen_item, not gen_item.rand_data.is_randomlike)
+                location.address = gen_location.id if gen_item.rand_data.is_randomlike else None
                 location.place_locked_item(item)
                 self.logger.debug(f"Locked: {location.name} - {item.name}")
 
         ## Handling unused floating items
-        ## Some unused floating items, such as expedition unlocks, are presume held if not randomized.
+        ## Some unused floating items, such as expedition unlocks, are presumed held if not randomized.
         ## We handle this by just giving it to the play as part of the starting inventory
         for i in self.gen_model.floating_items:
             gen_item = self.item_model_by_id[i]
-            if (not gen_item.is_randomized) and gen_item.rand_data.collected_by_default \
-                and gen_item.required_expedition in self.required_expeditions:
+            if (not gen_item.should_be_randomized()) and gen_item.rand_data.is_collected_by_default:
                 self.multiworld.push_precollected(self.create_item_by_model(gen_item))
         
         #######################################################################
-        ## Early Items
+        ## Start Vouchers and Early Items
 
-        ## Setting up the help used to get items by tag
-        def claim_by_tags(requested_tags: Mapping[int, int], callback: Callable[[Gen_Item], None], debug_name: str):
-            """Claims items by ID from the randomization list and calls the provided callback"""
+        start_items = self.sample_items(self.start_vouchers, False, "start_vouchers", rand_items)
+        for i in range(len(rand_items)):
+            gen_item = rand_items[i]
+            count = start_items.get(gen_item, 0)
+            if count <= 0: continue
+            start_items[gen_item] = count - 1
+            rand_items[i] = type(self).empty_item_model
+            self.multiworld.push_precollected(self.create_item_by_model(gen_item))
 
-            ## "r_" is short for "requested" and is used to prevent shadowing
-            for r_tag, r_count in requested_tags.items():
-                r_wl = {r_tag}
-                r_bl = set()
-
-                matches = [
-                    (1 if type(self).tags_listed(gi.name_tag, gi.tag2, gi.tag3, wl=r_wl, bl=r_bl) else 0)
-                    for gi in rand_items
-                ]
-                match_count = sum(matches)
-
-                if match_count < r_count:
-                    self.logger.warning(
-                        f"Requested {r_count} items matching tag {type(self).tag_model_by_id[r_tag].name}"
-                        f" for {debug_name}, found {match_count}; {match_count} items will be supplied."
-                    )
-                    for i in reversed(range(len(matches))):
-                        if matches[i] == 1:
-                            callback(rand_items.pop(i))
-                else:
-                    sample = self.random.sample(range(len(rand_items)), r_count, counts=matches)
-                    for i in reversed(sample):
-                        callback(rand_items.pop(i))
-
-        def early_item_callback(local_gi: Gen_Item) -> None:
-            local_item = self.create_item_by_model(local_gi)
-            self.multiworld.itempool.append(local_item)
-            early_items = self.multiworld.early_items.get(self.player, None)
-            if early_items is None:
-                early_items = dict()
-                self.multiworld.early_items[self.player] = early_items
-            early_items[local_item.name] = early_items.get(local_item.name, 0) + 1
-            self.logger.debug(f"Added as an early item: {local_item.name}")
-        claim_by_tags(self.early_items, early_item_callback, "early_items")
+        early_items = self.sample_items(self.early_items, False, "early_items", rand_items)
+        early_items_dict = self.multiworld.early_items.setdefault(self.player, dict())
+        early_items_dict.update({ self.tag_model_by_id[k.name_tag].name: v for k, v in early_items.items() })
 
         ## Finally, we simply add any remaining randomized items to the pool
         self.multiworld.itempool.extend(self.create_item_by_model(m) for m in rand_items)
@@ -614,32 +593,44 @@ class GTFOWorld(CachedRuleBuilderWorld):
 
         ## Set the tags so we can filter by tag for relevant goal items
         wl = { type(self).tag_model_by_name["Goal Items".lower()].id } ## By default, all goal items
-        bl = self.goal_blacklist
+        bl = set()
 
         ## Check each item ID that is *actually* spawned (including if it's spawned multiple times)
         all_item_ids = itertools.chain( 
-            ( loc.item_id for loc in self.reachable_locations if loc.item_id != 0 ),
+            ( loc.item_id for loc in self.reachable_locations ),
             self.gen_model.floating_items
         )
-        goal_names: List[str] = [ ]
-        self.goal_items = []
 
+        ## Collect all goal items!
+        all_goal_items = list()
         for item_id in all_item_ids:
-            gen_item = self.item_model_by_id.get(item_id, None)
-            if gen_item is None:
-                self.logger.warning(f"Failed to look up potential goal item with ID: {item_id}")
+            if item_id == 0: continue
+            gen_item = self.item_model_by_id[item_id]
+
+            if gen_item.required_expedition not in self.required_expeditions: continue
+            if not type(self).tags_match(*gen_item.tags(), tag_set=wl): continue
+            if type(self).tags_match(*gen_item.tags(), tag_set=bl): continue
+
+            all_goal_items.append(gen_item)
+
+        ## From available goal items, sample the items to be removed
+        blacklisted_items = self.sample_items(self.goal_blacklist, False, "goal_blacklist", all_goal_items)
+
+        ## Sort through the goal items and add them to our requirements
+        goal_names: List[str] = []
+        self.goal_items = []
+        for gen_item in all_goal_items:
+            blacklist_count = blacklisted_items.get(gen_item, 0)
+            if blacklist_count > 0:
+                blacklisted_items[gen_item] = blacklist_count - 1
                 continue
 
-            if gen_item.required_expedition in self.required_expeditions \
-                    and type(self).tags_listed(gen_item.name_tag, gen_item.tag2, gen_item.tag3, wl=wl, bl=bl):
-                item_tag = self.tag_model_by_id.get(gen_item.name_tag, None)
-                if item_tag is None:
-                    self.logger.error(f"Failed to find name tag for goal item: {item_id}")
-                else:
-                    self.goal_items.append(item_tag.id)
-                    goal_names.append(item_tag.name)
+            goal_names.append(type(self).tag_model_by_id[gen_item.name_tag].name)
+            self.goal_items.append(gen_item.id)
 
-        self.set_completion_rule(HasAll( *goal_names ))
+        ## Rule!
+        desired_count: int = len(goal_names) - self.skippable_goal_count
+        self.set_completion_rule(HasFromList(*goal_names, count=desired_count))
 
     @override
     def create_item(self, item_name: str) -> GTFOItem:
@@ -654,7 +645,9 @@ class GTFOWorld(CachedRuleBuilderWorld):
         return self.create_item_by_id(item_id)
     
     def create_item_by_id(self, item_id: int) -> GTFOItem:
-        
+        """
+        Create a particular item from just its ID.
+        """
         gen_item = self.item_model_by_id.get(item_id, None)
         if gen_item is None:
             self.logger.error(f"Failed to create item by id: {item_id}, using filler instead")
@@ -662,7 +655,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
         
         return self.create_item_by_model(gen_item)
 
-    def create_item_by_model(self, gen_item: Gen_Item, is_event: bool = False) -> GTFOItem:
+    def create_item_by_model(self, gen_item: ItemModel, is_event: bool = False) -> GTFOItem:
 
         ## Create classification data
         classification: ItemClassification = cast(ItemClassification, 0)
@@ -712,6 +705,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
             "BlacklistTags": self.blacklist_tags,
             "FilledEmptyLocations": self.filled_empty_locations,
             "GoalItems": self.goal_items,
+            "SkippableGoalCount": self.skippable_goal_count
         }
 
     @classmethod
@@ -720,25 +714,21 @@ class GTFOWorld(CachedRuleBuilderWorld):
         if tag in tag_set:
             return True
 
-        tag_def: Optional[Gen_Tag] = cls.tag_model_by_id.get(tag, None)
+        tag_def: Optional[TagModel] = cls.tag_model_by_id.get(tag, None)
         if tag_def is not None and cls.tag_matches(tag_def.parent, tag_set):
-            tag_set.add(tag)
+            #tag_set.add(tag)
             return True
         else:
             return False
 
     @classmethod
-    def tags_listed(cls, *tags: int, wl: Set[int], bl: Set[int]) -> bool:
-        """Check if any tag matches a particular whitelist and not a particular blacklist"""
-        return any( cls.tag_matches(tag, wl) and not cls.tag_matches(tag, bl) for tag in tags )
-
-    def tags_listed_default(self, *tags: int) -> bool:
-        """Check if any tag matches the default whitelist and not the default blacklist"""
-        return type(self).tags_listed(*tags, wl=self.whitelist_tags, bl=self.blacklist_tags)
+    def tags_match(cls, *tags: int, tag_set: Set[int]) -> bool:
+        """Returns true if any tag matches against the set of tags"""
+        return any( cls.tag_matches(tag, tag_set) for tag in tags )
 
     def sample_items(self, desired_tags: Mapping[int, int], allow_duplicates: bool, debug_name: str,
-                     source_list: Optional[List[Gen_Item | Gen_Location]] = None
-                     ) -> Mapping[Gen_Item | Gen_Location, int]:
+                     source_list: Optional[List[ItemModel | LocationModel]] = None
+                     ) -> Dict[ItemModel | LocationModel, int]:
         """
         Samples and returns a dict of (object, count) entries from the provided list matching the desired_tags arg.
         Tries to avoid duplicates. source_list defaults to all declared items in required_expeditions.
@@ -750,22 +740,26 @@ class GTFOWorld(CachedRuleBuilderWorld):
                 if item.required_expedition in self.required_expeditions
             ]
 
-        results: Dict[Gen_Item | Gen_Location, int] = {}
-        def add_result(items: List[Gen_Item | Gen_Location]) -> None:
+        results: Dict[ItemModel | LocationModel, int] = {}
+        def add_result(items: List[ItemModel | LocationModel]) -> None:
             """Small helper to add items to the results"""
             for it in items:
                 results[it] = results.get(it, 0) + 1
 
         for key, value in desired_tags.items():
+            ## Ignore empty keys in case we happen across them
+            if value == 0:
+                continue
+
             ## Collect items from source list which match
             candidates = [
                 item for item in source_list
-                if type(self).tags_listed(item.name_tag, item.tag2, item.tag3, wl={key}, bl=set())
+                if type(self).tags_match(*item.tags(), tag_set={key})
             ]
 
             if not candidates:
                 self.logger.warning(
-                    f"Desired {value} items for tag {key} in {debug_name},"
+                    f"Desired {value} items for tag {key} ({type(self).tag_model_by_id[key].name}) in {debug_name}"
                     + f" but only found {len(candidates)} matches"
                 )
                 continue
@@ -806,14 +800,14 @@ class GTFOWorld(CachedRuleBuilderWorld):
 class GTFOWorldBuilder:
     """Wraps the creation and storage of GTFO Worlds"""
 
-    vanilla_world: Optional[Type[GTFOWorld]] = None
-    """The main, "Vanilla" world created by this builder"""
-
-    all_worlds: Dict[str, Type[GTFOWorld]] = dict()
+    all_worlds: ClassVar[Dict[Optional[str], Type[GTFOWorld]]] = dict()
     """
     All worlds made by this builder, keyed by name (ie "GTFO (MyModSet)"). 
-    Includes the vanilla world, which is keyed under the name "GTFO"
+    Includes the vanilla world, which is keyed under None.
     """
+
+    logger: ClassVar[logging.Logger] = logging.getLogger("GTFO World Builder")
+    """Logger used for building worlds"""
 
     ## Might add string formatting to this later to include some info about the mod set
     docstring: ClassVar[str] = \
@@ -827,6 +821,27 @@ class GTFOWorldBuilder:
     """The docstring used by worlds created by this builder"""
 
     @classmethod
+    def try_load_file(cls, file: Union[Traversable, Path], filename: str) -> Optional[GameDataModel]:
+        """Attempt to load the model from the asset; returns None on fail and logs the exception"""
+        gen_model: Optional[GameDataModel] = None
+        try:
+            with file.open("r") as file_data:
+                gen_model = GameDataModel.model_validate_json(file_data.read())
+        except OSError as e:  ## Failed to open file
+            cls.logger.error(f"Failed open GTFO MID file: {filename}")
+            cls.logger.exception(e)
+        except json.JSONDecodeError as e:  ## JSON parsing failed
+            cls.logger.error(f"Failed to parse GTFO MID file: {filename}")
+            cls.logger.exception(e)
+        except ValidationError as e:  ## pydantic failed to validate data
+            cls.logger.error(f"Failed to validate GTFO MID data: {filename}")
+            cls.logger.exception(e)
+        except Exception as e:  ## Generic failure during gen_model instantiation
+            cls.logger.error(f"Malformed GTFO MID data: {filename}")
+            cls.logger.exception(e)
+        return gen_model
+
+    @classmethod
     def make_worlds(cls):
         """
         Create / rebuild all GTFO worlds from file.
@@ -834,73 +849,73 @@ class GTFOWorldBuilder:
          cleaned of existing GTFO worlds, or for any other dangling references.
         """
 
-        ## Define this now so we can choose to overwrite it as we scan
-        main_file: Union[Traversable, Path] = importlib.resources.files().joinpath("data").joinpath("GTFO.ini")
-
-        ## Check players folder for modded worlds or vanilla override data (new version, for example)
+        ## Scan for worlds in the players directory
+        found_worlds: Dict[Optional[str], GameDataModel] = dict()
         for file in Path(f"{Utils.local_path()}/Players").iterdir():
             lower = file.name.lower()
             if not file.is_file():
-                pass
-            elif lower.startswith("gtfo-") and lower.endswith(".ini"):
-                g_name = f"GTFO ({file.name[5:-4]})" ## Removes gtfo- and .ini
-                cls.all_worlds[g_name] = cls.make_world(g_name, file)
-            elif lower == "gtfo.ini":
-                main_file = file.resolve() ## Overrides the vanilla definition
+                continue
+            if not (lower.startswith("gtfo-") and lower.endswith(".ini")):
+                continue
 
-        ## Create the main ("vanilla") world
-        g_name = "GTFO"
-        klass = cls.make_world(g_name, main_file)
-        cls.vanilla_world = klass
-        cls.all_worlds[g_name] = klass
+            gen_model = cls.try_load_file(file, file.name)
+            if gen_model is None:
+                continue
+            if gen_model.name in cls.all_worlds:
+                cls.logger.warning(f"Skipping MID file because a duplicate is already defined: {file.name}")
+                del gen_model
+                continue
+            found_worlds[gen_model.name] = gen_model
+
+        ## Add the vanilla world (if an override was not found)
+        if None not in found_worlds:
+            file = importlib.resources.files().joinpath("data").joinpath("GTFO.ini")
+            gen_model = cls.try_load_file(file, "builtin")
+            if gen_model is None:
+                raise NotImplementedError
+            found_worlds[None] = gen_model
+
+        ## Create all the worlds!
+        for value in found_worlds.values():
+            cls.make_world(value)
 
     @classmethod
-    def make_world(cls, world_name: str, world_file: Union[Path, Traversable]) -> Type[GTFOWorld]:
+    def make_world(cls, gen_model: GameDataModel) -> Type[GTFOWorld]:
         """Programmatically create a new AutoWorldRegister for the given GTFO world."""
 
-        if world_name in GTFOWorldBuilder.all_worlds is None:
-            raise Exception("Exception!")
+        ## If we attempt to create a duplicate world, Archipelago will throw a fit
+        if gen_model.name in GTFOWorldBuilder.all_worlds:
+            raise Exception("Cannot create duplicate GTFO world!")
 
         ## Using a SimpleNamespace to provide type hints
         world_class = SimpleNamespace(**GTFOWorld.__dict__)
         world_class: Type[GTFOWorld]
 
-        ## Attempt to find and load data from file
-        try:
-            with world_file.open("r") as file_data:
-                world_class.gen_model = Gen_GameData.model_validate_json(file_data.read())
-        except OSError as e: ## Failed to open file
-            raise Exception(f"Failed to find GTFO MID file for game: {world_name}") from e
-        except json.JSONDecodeError as e: ## JSON parsing failed
-            raise Exception(f"Failed to parse GTFO MID file for game: {world_name}") from e
-        except ValidationError as e: ## pydantic failed to validate data
-            raise Exception(f"Failed to validate GTFO MID file for game: {world_name}") from e
-        except Exception as e: ## Generic failure during gen_model instantiation
-            raise Exception(f"Malformed GTFO MID file for game: {world_name}") from e
-
+        ###########################################################################################
         ## Init class variables
-        world_class.game = world_name
+
+        world_class.game = "GTFO" if gen_model.name is None else f"GTFO ({gen_model.name})"
         world_class.__doc__ = GTFOWorldBuilder.docstring
-        world_class.gen_model = world_class.gen_model
-        world_class.class_logger = logging.getLogger(f"GTFO.{world_name}")
-        world_class.tag_model_by_id = { tag.id: tag for tag in world_class.gen_model.tags }
-        world_class.tag_model_by_name = { tag.name.lower(): tag for tag in world_class.gen_model.tags }
-        world_class.item_model_by_id = { item.id: item for item in world_class.gen_model.items }
+        world_class.gen_model = gen_model
+        world_class.class_logger = logging.getLogger(f"GTFO.{gen_model.name}")
+        world_class.tag_model_by_id = { tag.id: tag for tag in gen_model.tags }
+        world_class.tag_model_by_name = { tag.name.lower(): tag for tag in gen_model.tags }
+        world_class.item_model_by_id = { item.id: item for item in gen_model.items }
         world_class.location_name_to_id = \
-            { world_class.tag_model_by_id[loc.name_tag].name: loc.id for loc in world_class.gen_model.locations }
+            { world_class.tag_model_by_id[loc.name_tag].name: loc.id for loc in gen_model.locations }
         world_class.item_name_to_id = \
-            { world_class.tag_model_by_id[item.name_tag].name: item.id for item in world_class.gen_model.items }
+            { world_class.tag_model_by_id[item.name_tag].name: item.id for item in gen_model.items }
 
         empty_item = world_class.item_name_to_id.get("Empty", None)
         if empty_item is None:
-            world_class.class_logger.error(f"Failed to find the empty item for game: {world_name}")
+            world_class.class_logger.error(f"Failed to find the empty item for GTFO world: {gen_model.name}")
         else:
             world_class.empty_item_model = world_class.item_model_by_id[empty_item]
 
         ## Set up item groups and name mapping
         world_class.item_name_groups = dict()
         world_class.item_mapping = dict()
-        for gen_item in world_class.gen_model.items:
+        for gen_item in gen_model.items:
             if gen_item.path_reqs.type != "Category": continue
             item_name = world_class.tag_model_by_id[gen_item.name_tag].name
             group_name = world_class.tag_model_by_id[gen_item.path_reqs.target].name
@@ -914,70 +929,51 @@ class GTFOWorldBuilder:
 
             world_class.item_mapping[item_name] = group_name
 
-        ## Create options dataclass
-        options_dict = GTFOOptions.__dict__.copy()
-        del options_dict["__init__"] ## Fun little quirk which would prevent dataclass from generating a new __init__
+        ###########################################################################################
+        ## Options creation
+
+        ## Creating the options lookup
+        world_class.option_model_by_id = { o.id: o for o in gen_model.options }
+
+        ## Define the options dataclass
+        options_dict = { "__annotations__": dict() }
+        #options_dict = GTFOOptions.__dict__.copy()
+        #del options_dict["__init__"] ## Fun little quirk which would prevent dataclass from generating a new __init__
+
+        ## Options grouping by name; we later calc the option groups once we've created all option inputs
         option_groups_raw: Dict[str, List[Type[Options.Option]]] = options.gtfo_option_grouping.copy()
-        option_effects: List[Mapping[Any, Mapping[str, List[int]]]] = []
-        option_count = 0
-        for option in world_class.gen_model.options:
 
-            ## Figure out which option we're making
-            option_base: Type[Options.Option]
-            if option.type == "Toggle":
-                option_base = Options.Toggle
-            elif option.type == "DefaultOnToggle":
-                option_base = Options.DefaultOnToggle
-            elif option.type == "Choice":
-                option_base = Options.Choice
-            else:
-                raise Exception(f"Failed to identify option type: {option.type}")
+        ## Search for and add input options
+        for option in gen_model.options:
 
-            ## Common option configuration
-            option_dict: Dict[str, Any] = option_base.__dict__.copy()
-            option_dict["display_name"] = option.name
-            option_dict["__doc__"] = option.description
+            ## If this is an input, add it to the options dataclass
+            if isinstance(option, OptionInputModel):
 
-            ## Set up the effects list
-            effect_list: Mapping[Any, Mapping[str, List[int]]] = option.choices
-            if option.type in [ "Toggle", "DefaultOnToggle" ]:
-                effect_list = {
-                    True: effect_list["True"],
-                    False: effect_list["False"]
-                }
-            elif option.type == "Choice":
-                numbered_effect_list: Dict[int, Mapping[str, List[int]]] = dict()
-                option_i = 0
-                for choice, effect in effect_list.items():
-                    option_dict[f"option_{choice}"] = option_i
-                    numbered_effect_list[choice] = effect
-                    option_i += 1
-                option_dict["default"] = option_dict[f"option_{option.default_value}"]
-                effect_list = numbered_effect_list
-            option_effects.append(effect_list)
+                ## Create the option class
+                option: OptionInputModel
+                option_base, option_dict = option.get_class()
+                option_name = option.get_name()
+                option_class = type(option_base)(option_name, (option_base,), option_dict)
 
-            ## Create the option and set it up as an annotation in the options class
-            option_name = f"option_{option_count}"
-            option_class = type(option_base)(f"{world_class.game} {option_name}", (option_base,), option_dict)
-            options_dict["__annotations__"][option_name] = option_class
-            option_count += 1
-
-            ## Add the new option to the relevant group
-            group = option_groups_raw.get(option.category, None)
-            if group is None:
-                group = list()
-                option_groups_raw[option.category] = group
-            group.append(option_class)
+                ## Add the option to the options class and groupings
+                options_dict["__annotations__"][option_name] = option_class
+                group = option_groups_raw.get(option.category, None)
+                if group is None:
+                    group = list()
+                    option_groups_raw[option.category] = group
+                group.append(option_class)
 
         ## Finally, create the options dataclass and assign it to our generated world
         options_class = type(GTFOOptions)(f"{world_class.game} options_dataclass", (GTFOOptions,), options_dict)
         options_class = cast(GTFOOptions, dataclasses.dataclass(options_class, init=True))
         world_class.options_dataclass = options_class
         world_class.option_groups = [ Options.OptionGroup(name, items) for name, items in option_groups_raw.items() ]
-        world_class.option_effects = option_effects
+
+        ###########################################################################################
+        ## Create the world class!
 
         ## Note that we use the metaclass associated with GTFOWorld to create the derived instance
-        return cast(Type[GTFOWorld], type(GTFOWorld)(world_name, (GTFOWorld,), world_class.__dict__))
+        return cast(Type[GTFOWorld], type(GTFOWorld)(f"GTFO ({gen_model.name})", (GTFOWorld,), world_class.__dict__))
 
 ## Now we simply create all the GTFO worlds
 GTFOWorldBuilder.make_worlds()
