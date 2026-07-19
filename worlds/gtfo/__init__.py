@@ -1,27 +1,34 @@
 # world/gtfo/__init__.py
 
 from __future__ import annotations
-import dataclasses
+
+from collections import Counter
 import importlib.resources
 from importlib.resources.abc import Traversable
+import inspect
 import itertools
 import json
 import logging
 from pathlib import Path
-from typing import Any, cast, ClassVar, Dict, Iterable, List, Mapping, Optional, override, Set, Tuple, Type, Union
+from typing import Any, cast, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional, override, Set, Tuple, \
+    Type, Union
 from types import SimpleNamespace
-import Utils
 
-import Options
 from BaseClasses import Region, Location, Item, ItemClassification, LocationProgressType
+import Options
+from Options import Option
 from rule_builder.cached_world import CachedRuleBuilderWorld
-from rule_builder.rules import Rule, And, Or, Has, HasGroup, CanReachRegion, HasFromList, False_
+from rule_builder.rules import And, CanReachRegion, False_, Has, HasGroup, HasFromList, Or, Rule, True_
+import Utils
+from worlds.AutoWorld import WebWorld
 
-from .options import GTFOOptions, OptionEvaluationState
-from .model import GameDataModel, ExpeditionDataModel, TagModel, RegionModel, PathModel, ReqItemModel, \
-                    LocationModel, LocationDataModel, ItemModel, ItemDataModel, \
-                    OptionBaseModel, OptionInputModel
-from pydantic import ValidationError
+from .model import SlotDataModel, GameDataModel, TagModel, TaggedRegionModel, PathModel, PathReqModel, \
+    LocationTagModel, RealLocationTagModel, LocationModel, ItemTagModel, ItemModel, FloatingItemModel, \
+    OptionBaseModel, OptionInputModel, RealItemTagModel
+from .options import OptionsEvaluator, SkippableGoalCount, FailIfInsufficientEmptyLocations, \
+    RegionWhitelist, RegionBlacklist, LocationWhitelist, LocationBlacklist, ItemWhitelist, ItemBlacklist, \
+    EarlyItems, StartVouchers, GTFOLocalItems, GTFONonLocalItems, GTFOStartInventory, RootSeed, \
+    GTFOExcludeLocations, GTFOPriorityLocations, GoalItems, GTFOLocationHints, GTFOItemHints, FailDuringSampling
 
 class GTFOLocation(Location):
     game: str = "GTFO"
@@ -44,93 +51,118 @@ class GTFOWorld(CachedRuleBuilderWorld):
     """The name of this game. This will be overwritten from MID data"""
     topology_present: bool = True
     """Indicates the regions of this game correspond to actual physical locations (which is mostly true)"""
-    options_dataclass: ClassVar[GTFOOptions]
+    options_dataclass: ClassVar[object]
     """The dataclass to use for this world. This will be set from MID data."""
-
-    _options: GTFOOptions
-    """Actual options instance for this world"""
-
-    @property
-    def options(self) -> GTFOOptions:
-        """Options getter; required because we need to react to set operations"""
-        return self._options
-
-    @options.setter
-    def options(self, value: GTFOOptions):
-        """Options setter, used to update internal state when the options are set/changed"""
-        self._options = value
-        self.setup_from_options()
-
     location_name_to_id: ClassVar[Dict[str, int]]
     """Map of location names to location IDs. This will be populated from MID data"""
     item_name_to_id: ClassVar[Dict[str, int]]
     """Map of item names to item IDs. This will be populated from MID data"""
     item_name_groups: ClassVar[Dict[str, Set[str]]]
     """Maps an item group name to a set of item names. This will be populated from MID data"""
-    item_mapping: ClassVar[Dict[str, str]]
-    """Maps an item name to its group. This will be populated from MID data"""
+    item_mapping: ClassVar[Dict[str, str]] = dict()
+    """Maps an actual item name to a logical item name. For GTFO, this is kept empty."""
+    web: ClassVar[WebWorld]
+    """Web world to be used by this world"""
+
+    ## Options handled as a property so we can perform some funny business when it's assigned
+    _options: object
+    """Actual options instance for this world"""
+    @property
+    def options(self) -> object:
+        """Options getter; required because we need to react to set operations"""
+        return self._options
+    @options.setter
+    def options(self, value: object):
+        """Options setter, used to update internal state when the options are set/changed"""
+        self._options = value
+        self.setup_from_options()
 
     ## Class variables
     class_logger: ClassVar[logging.Logger]
     """Logger for the class (world)"""
     gen_model: ClassVar[GameDataModel]
     """Imported MID data"""
-    tag_model_by_id: ClassVar[Mapping[int, TagModel]]
-    """Tag lookup via ID"""
-    tag_model_by_name: ClassVar[Mapping[str, TagModel]]
-    """Tag lookup via name"""
-    item_model_by_id: ClassVar[Mapping[int, ItemModel]]
+    region_name_to_id_casefold: ClassVar[Dict[str, int]]
+    """Map of regions name to region IDs"""
+    location_name_to_id_casefold: ClassVar[Dict[str, int]]
+    """Map of location names to location IDs"""
+    item_name_to_id_casefold: ClassVar[Dict[str, int]]
+    """Map of item names to item IDs"""
+    region_model_by_id: ClassVar[Mapping[int, TaggedRegionModel]]
+    """Region lookup by id"""
+    location_model_by_id: ClassVar[Mapping[int, LocationTagModel]]
+    """Location lookup by id"""
+    item_model_by_id: ClassVar[Mapping[int, ItemTagModel]]
     """Item lookup by id"""
-    empty_item_model: ClassVar[ItemModel]
+    empty_item_model: ClassVar[RealItemTagModel]
     """Default filler item which does nothing. To be replaced with filler items in future update"""
     option_model_by_id: ClassVar[Mapping[int, OptionBaseModel]]
     """Option model lookup used for options evaluation"""
-    option_groups: ClassVar[List[Options.OptionGroup]]
-    """List of generated option groups for the option dataclass"""
 
     ## Per-player variables
     logger: logging.Logger
     """Logger for the world instance, ie one per player"""
-    start_vouchers: Dict[int, int]
-    """Dict of (tag, count) of items to pull prior to randomization and add to the starting inventory"""
-    early_items: Dict[int, int]
-    """Dict of (tag, count) of items to set as early"""
-    #local_items: Set[int]
-    """Tags for items to force as local. Removed because we make Archipelago handle this for us."""
-    #non_local_items: Set[int]
-    """Tags for items to force as nonlocal. Removed because we make Archipelago handle this for us."""
-    #start_inventory: Mapping[int, int]
-    """Tags and counts for items to place in our starting inventory. Removed because we make Archipelago handle this"""
-    #start_hints: Mapping[int, int]
-    """Tags and counts for items and locations which start hinted. Removed because we make Archipelago handle this."""
-    exclude_locations: Set[int]
-    """Tags for locations to override and mark as excluded"""
-    priority_locations: Set[int]
-    """Tags for locations to override and mark as priorities"""
-    goal_blacklist: Dict[int, int]
-    """Tag blacklist for goal items. The whitelist is all goal items"""
-    reachable_regions: Set[int]
-    """The set of region IDs that can be reached using the provided settings"""
-    reachable_locations: Set[LocationModel]
-    """The set of location IDs fully contained within reachable_regions"""
-
-    ## Slot data
-    root_seed: int = 0
-    """Seed used for randomization"""
-    required_expeditions: Set[Optional[str]]
-    """Set of expeditions the player is required to explore; set of expeditions available to the player"""
-    whitelist_tags: Set[int]
-    """Whitelist tags for testing randomization of locations and items"""
-    blacklist_tags: Set[int]
-    """Blacklist tags for testing randomization of locations and items"""
-    filled_empty_locations: List[Tuple[int, int]]
-    """List of empty locations that were filled with a floating item during generation"""
-    goal_items: List[int]
-    """List of items required to reach the goal"""
-    skippable_goal_count: int
-    """Number of goal items which can be skipped"""
+    options_evaluation: OptionsEvaluator
+    """Option evaluation created and evaluated when the options are assigned"""
     fail_if_insufficient_empty_locations: bool
     """If true, raise an exception if there are insufficient empty locations for the selected floating items"""
+    fail_during_sampling: bool
+    """If true, raise an exception if sampling fails to one or more tag matches"""
+    slot_data: SlotDataModel
+    """Future slot data"""
+    root_seed: int
+    """Seed chosen and shared for generation"""
+
+    reachable_regions: Set[int] ## It's just easier to track this as ints
+    """Set of all regions which are both randomized and reachable"""
+    reachable_locations: List[RealLocationTagModel]
+    """List of all locations which are fully contained in the reachable regions set AND are not randomized"""
+    randomized_locations: List[RealLocationTagModel]
+    """List of all locations which are fully contained in the reachable regions set AND are randomized"""
+    item_pool: Counter[int]
+    """Counter of items which are randomized"""
+    filled_empty_locations: List[Tuple[int, int]]
+    """Maps reachable empty locations to the items they get filled with during generation"""
+    growing_item_counts: Counter[int] = Counter()
+    """Current sum of encountered growing paths"""
+    goal_item_results: Counter[int]
+    """Resulting list of goal items calculated from reachable items"""
+    skippable_goal_count: int
+    """Number of goal items we can skip"""
+
+    region_whitelist: Set[int]
+    """Whitelist for regions"""
+    region_blacklist: Set[int]
+    """Blacklist for regions"""
+    location_whitelist: Set[int]
+    """Whitelist for locations"""
+    location_blacklist: Set[int]
+    """Blacklist for locations"""
+    item_whitelist: Set[int]
+    """Whitelist for items"""
+    item_blacklist: Set[int]
+    """Blacklist for items"""
+
+    goal_items: Counter[int]
+    """Dict of (tag, count) of items to demand for the player to win the goal"""
+    start_inventory: Counter[int]
+    """Tags and counts for items to place in our starting inventory"""
+    start_vouchers: Counter[int]
+    """Dict of (tag, count) of items to pull prior to randomization and add to the starting inventory"""
+    early_items: Counter[int]
+    """Dict of (tag, count) of items to set as early"""
+    local_items: Counter[int]
+    """Tags for items to force as local"""
+    non_local_items: Counter[int]
+    """Tags for items to force as nonlocal"""
+    item_hints: Counter[int]
+    """Tags and counts for items which start hinted."""
+    location_hints: Counter[int]
+    """Tags and counts for locations which start hinted."""
+    priority_locations: Counter[int]
+    """Tags for locations to override and mark as priorities"""
+    exclude_locations: Counter[int]
+    """Tags for locations to override and mark as excluded"""
 
     ## Universal Tracker integration
     ut_can_gen_without_yaml: ClassVar[bool] = True
@@ -155,184 +187,525 @@ class GTFOWorld(CachedRuleBuilderWorld):
         #######################################################################
         ## Init data
 
-        self.root_seed = self.random.randrange(0, 2**52)
-        self.required_expeditions = self.options.required_expeditions.value.copy()
-        if "All" in self.required_expeditions:
-            self.required_expeditions = { e.name for e in self.gen_model.expeditions }
-        self.skippable_goal_count = self.options.skippable_goal_count.value
-        self.fail_if_insufficient_empty_locations = self.options.fail_if_insufficient_empty_locations.value != 0
+        def get_option[T: Option](opt_type: Type[T]) -> T:
+            """Helper to get a particular option from the options class"""
+            return getattr(self.options, getattr(opt_type, "display_name", opt_type.__name__))
 
-        ## Universal Tracker integration
-        re_gen_passthrough = getattr(self.multiworld, "re_gen_passthrough", {})
-        if re_gen_passthrough and self.game in re_gen_passthrough:
-            slot_data: Dict[str, Any] = re_gen_passthrough[self.game]
-            self.root_seed = slot_data["RootSeed"]
-            self.required_expeditions = slot_data["ExpeditionNames"]
-            self.skippable_goal_count = slot_data["SkippableGoalCount"]
-
-        ## Enforces consistency between UT and non-UT
-        self.random.seed(self.root_seed)
-
-        ## Identify reachable regions
-        expedition_lookup = { e.name: e for e in self.gen_model.expeditions }
-        not_found_expeditions: List[str] = []
-        self.reachable_regions = set()
-        for e_name in self.required_expeditions:
-            if e_name is None: continue
-            e: Optional[ExpeditionDataModel] = expedition_lookup.get(e_name)
-            if e is None:
-                not_found_expeditions.append(e_name)
-            else:
-                self.reachable_regions.update(e.reachable_regions)
-
-        ## Identify and add menu region
-        for r in self.gen_model.regions:
-            if r.name == self.origin_region_name:
-                self.reachable_regions.add(r.id)
-
-        self.required_expeditions.add(None)  ## Makes logic easier
-        self.reachable_locations = {
-            l for l in self.gen_model.locations if all(r in self.reachable_regions for r in l.owning_regions)
-         }
+        cls = type(self)
+        self.root_seed = get_option(RootSeed).value or self.random.randrange(0, 2**52)
+        self.fail_if_insufficient_empty_locations = get_option(FailIfInsufficientEmptyLocations).value != 0
+        self.fail_during_sampling = get_option(FailDuringSampling).value != 0
+        self.skippable_goal_count = get_option(SkippableGoalCount).value
 
         #######################################################################
         ## Import user options as tags
 
-        oe_state = OptionEvaluationState()
-        oe_state.world = self
-        oe_state.started_ids = set()
-        oe_state.evaluated_ids = set()
-        oe_state.not_found_tags = dict()
-        def move_to_tag_set(dest: Set[int], source: Iterable[str], debug_name: str) -> None:
+        errors: List[Tuple[str, List[str], Dict[str, int]]] = list()
+
+        def move_to_tag_set(src: Iterable[str], dest: Set[int], tag_lookup: Dict[str, int], debug_name: str) -> None:
             """Helper which moves a list of tag names into a set"""
-            for key in source:
-                found_tag = type(self).tag_model_by_name.get(key.lower(), None)
+            local_errors = list()
+            for key in src:
+                found_tag = tag_lookup.get(key.casefold(), None)
                 if found_tag is None:
-                    oe_state.not_found_tags.setdefault(debug_name, []).append(key)
+                    local_errors.append(key)
                 else:
-                    dest.add(found_tag.id)
+                    dest.add(found_tag)
+            if local_errors:
+                errors.append((debug_name, local_errors, tag_lookup))
 
-        def move_to_tag_dict(dest: Dict[int, int], source: Mapping[str, int], debug_name: str) -> None:
+        self.region_whitelist = set()
+        opt = get_option(RegionWhitelist)
+        move_to_tag_set(
+            opt.value,
+            self.region_whitelist,
+            cls.region_name_to_id_casefold,
+            opt.display_name
+        )
+        self.region_whitelist.add(cls.region_name_to_id_casefold["always"])
+
+        self.region_blacklist = set()
+        opt = get_option(RegionBlacklist)
+        move_to_tag_set(
+            opt.value,
+            self.region_blacklist,
+            cls.region_name_to_id_casefold, opt.display_name
+        )
+        self.region_blacklist.add(cls.region_name_to_id_casefold["never"])
+
+        self.location_whitelist = set()
+        opt = get_option(LocationWhitelist)
+        move_to_tag_set(
+            opt.value,
+            self.location_whitelist,
+            cls.location_name_to_id_casefold, opt.display_name
+        )
+        self.location_whitelist.add(cls.location_name_to_id_casefold["always"])
+
+        self.location_blacklist = set()
+        opt = get_option(LocationBlacklist)
+        move_to_tag_set(
+            opt.value,
+            self.location_blacklist,
+            cls.location_name_to_id_casefold, opt.display_name
+        )
+        self.location_blacklist.add(cls.location_name_to_id_casefold["never"])
+
+        self.item_whitelist = set()
+        opt = get_option(ItemWhitelist)
+        move_to_tag_set(
+            opt.value,
+            self.item_whitelist,
+            cls.item_name_to_id_casefold, opt.display_name
+        )
+        self.item_whitelist.add(cls.item_name_to_id_casefold["always"])
+
+        self.item_blacklist = set()
+        opt = get_option(ItemBlacklist)
+        move_to_tag_set(
+            opt.value,
+            self.item_blacklist,
+            cls.item_name_to_id_casefold, opt.display_name
+        )
+        self.item_blacklist.add(cls.item_name_to_id_casefold["never"])
+
+        def move_to_tag_dict(src: Mapping[str, int], dest: Counter[int],
+                             tag_lookup: Dict[str, int], debug_name: str) -> None:
             """Helper which moves a dict of string tag names into a dict of tag counts"""
-            for key, value in source.items():
-                found_tag = type(self).tag_model_by_name.get(key.lower(), None)
+            local_errors = list()
+            for k, v in src.items():
+                found_tag = tag_lookup.get(k.casefold(), None)
                 if found_tag is None:
-                    oe_state.not_found_tags.setdefault(debug_name, []).append(key)
+                    local_errors.append(k)
+                elif found_tag in tag_lookup:
+                    raise NotImplementedError(f"The key '{k}' cannot be defined twice for option '{debug_name}'")
                 else:
-                    dest[found_tag.id] = (value if value is not None else 0)
+                    dest[found_tag] = v
+            if local_errors:
+                errors.append((debug_name, local_errors, tag_lookup))
 
-        self.whitelist_tags = set()
-        move_to_tag_set(self.whitelist_tags, self.options.whitelist.value, "whitelist_tags")
-        always_tag = type(self).tag_model_by_name.get("Always".lower(), None)
-        if always_tag is not None: self.whitelist_tags.add(always_tag.id)
+        self.goal_items = Counter()
+        opt = get_option(GoalItems)
+        move_to_tag_dict(
+            opt.value,
+            self.goal_items,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
-        self.blacklist_tags = set()
-        move_to_tag_set(self.blacklist_tags, self.options.blacklist.value, "blacklist_tags")
-        never_tag = type(self).tag_model_by_name.get("Never".lower(), None)
-        if never_tag is not None: self.blacklist_tags.add(never_tag.id)
+        self.start_inventory = Counter()
+        opt = get_option(GTFOStartInventory)
+        move_to_tag_dict(
+            opt.value,
+            self.start_inventory,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
-        self.early_items = dict()
-        move_to_tag_dict(self.early_items, self.options.early_items.value, "early_items")
+        self.start_vouchers = Counter()
+        opt = get_option(StartVouchers)
+        move_to_tag_dict(
+            opt.value,
+            self.start_vouchers,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
-        self.start_vouchers = dict()
-        move_to_tag_dict(self.start_vouchers, self.options.start_vouchers.value, "start_vouchers")
+        self.early_items = Counter()
+        opt = get_option(EarlyItems)
+        move_to_tag_dict(
+            opt.value,
+            self.early_items,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
-        oe_state.local_items = set()
-        move_to_tag_set(oe_state.local_items, self.options.gtfo_local_items.value, "local_items")
+        self.local_items = Counter()
+        opt = get_option(GTFOLocalItems)
+        move_to_tag_dict(
+            opt.value,
+            self.local_items,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
-        oe_state.non_local_items = set()
-        move_to_tag_set(oe_state.non_local_items, self.options.gtfo_non_local_items.value, "non_local_items")
+        self.non_local_items = Counter()
+        opt = get_option(GTFONonLocalItems)
+        move_to_tag_dict(
+            opt.value,
+            self.non_local_items,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
-        oe_state.start_inventory = dict()
-        move_to_tag_dict(oe_state.start_inventory, self.options.gtfo_start_inventory.value, "start_inventory")
+        self.item_hints = Counter()
+        opt = get_option(GTFOItemHints)
+        move_to_tag_dict(
+            opt.value,
+            self.item_hints,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
-        oe_state.start_hints = dict()
-        move_to_tag_dict(oe_state.start_hints, self.options.gtfo_start_hints.value, "start_hints")
+        self.location_hints = Counter()
+        opt = get_option(GTFOLocationHints)
+        move_to_tag_dict(
+            opt.value,
+            self.location_hints,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
-        self.exclude_locations = set()
-        move_to_tag_set(self.exclude_locations, self.options.gtfo_exclude_locations.value, "exclude_locations")
+        self.priority_locations = Counter()
+        opt = get_option(GTFOPriorityLocations)
+        move_to_tag_dict(
+            opt.value,
+            self.priority_locations,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
-        self.priority_locations = set()
-        move_to_tag_set(self.priority_locations, self.options.gtfo_priority_locations.value, "priority_locations")
-
-        self.goal_blacklist = dict()
-        move_to_tag_dict(self.goal_blacklist, self.options.goal_blacklist.value, "goal_blacklist")
+        self.exclude_locations = Counter()
+        opt = get_option(GTFOExcludeLocations)
+        move_to_tag_dict(
+            opt.value,
+            self.exclude_locations,
+            cls.item_name_to_id_casefold,
+            opt.display_name
+        )
 
         ## Evaluate options
-        for option in self.option_model_by_id.values():
-            oe_state.evaluate(option)
+        re_gen_passthrough = getattr(self.multiworld, "re_gen_passthrough", {})
+        if re_gen_passthrough and self.game in re_gen_passthrough:
+            ## Universal Tracker integration
+            slot_data = SlotDataModel(re_gen_passthrough[self.game])
+            self.root_seed = slot_data.root_seed
 
-        ## Report badly-formatted (or erroneous) expedition names and tag names
-        if not_found_expeditions or oe_state.not_found_tags:
-            error_message: str = f"YAML file parsing failed for player: {self.multiworld.get_player_name(self.player)}"
+            self.random.seed(self.root_seed) ## Enforces consistency between UT and non-UT
+            oe = OptionsEvaluator(self)
+            for option in self.option_model_by_id.keys():
+                oe.get_output(option)
 
-            ## Expedition checking
-            if not_found_expeditions:
-                error_message += f"Failed to find {len(not_found_expeditions)} expeditions."
-                choices = expedition_lookup.keys()
-                for e_name in not_found_expeditions:
-                    match = Utils.get_fuzzy_results(e_name, choices, 1)
+            self.region_whitelist = set(slot_data.region_whitelist)
+            self.region_blacklist = set(slot_data.region_blacklist)
+            self.location_whitelist = set(slot_data.location_whitelist)
+            self.location_blacklist = set(slot_data.location_blacklist)
+            self.item_whitelist = set(slot_data.item_whitelist)
+            self.item_blacklist = set(slot_data.item_blacklist)
+        else:
+            self.random.seed(self.root_seed) ## Enforces consistency between UT and non-UT
+            oe = OptionsEvaluator(self)
+            for option in self.option_model_by_id.keys():
+                oe.get_output(option)
+
+
+        ## Report errors!
+        if errors:
+            error_message: str = \
+                f"YAML file parsing failed for player: {self.multiworld.get_player_name(self.player)}" \
+                + "\nDebug is printed below. All tag names are case-insensitive."
+
+            for opt_name, error_items, tag_dict in errors:
+                count = len(error_items)
+                error_message += f'\nFailed to find {count} tag{"" if count == 1 else "s"} for option "{opt_name}":'
+                for e in error_items:
+                    match = Utils.get_fuzzy_results(e.casefold(), tag_dict.keys(), 1)
                     if match and match[0][1] > .3:
-                        error_message += f'\n -"{e_name}" (Did you mean "{match[0][0]}"? {100 * match[0][1]}% certain)'
+                        error_message += f'\n -"{e}" (Did you mean "{match[0][0]}"? {100 * match[0][1]}% certain)'
                     else:
-                        error_message += f'\n -"{e_name}" (No likely matches found)'
-
-            ## Tag checking
-            tag_choices = self.tag_models.keys()
-            for option_name, tags in oe_state.not_found_tags:
-                error_message += f"Failed to find {len(tags)} tags in setting {option_name}."
-                for t_name in tags:
-                    match = Utils.get_fuzzy_results(t_name, tag_choices, 1)
-                    if match and match[0][1] > .3:
-                        error_message += f'\n -"{t_name}" (Did you mean "{match[0][0]}"? {100 * match[0][1]}% certain)'
-                    else:
-                        error_message += f'\n -"{t_name}" (No likely matches found)'
+                        error_message += f'\n -"{e}" (No likely matches found)'
 
             raise Exception(error_message)
 
-        ## Overwrite the settings we don't control so we can pass them off to Archipelago
-        local_items_setting = options.LocalItems([
-            self.tag_model_by_id[item.name_tag].name for item in type(self).gen_model.items
-            if item.required_expedition in self.required_expeditions
-            and type(self).tags_match(*item.tags(), tag_set=oe_state.local_items)
-        ])
-        nonlocal_items_setting = options.NonLocalItems([
-            self.tag_model_by_id[item.name_tag].name for item in type(self).gen_model.items
-            if item.required_expedition in self.required_expeditions
-            and type(self).tags_match(*item.tags(), tag_set=oe_state.non_local_items)
-        ])
-        start_inventory_setting = options.StartInventory({
-            self.tag_model_by_id[key.name_tag].name: value for key, value
-            in self.sample_items(oe_state.start_inventory, True, "Start Inventory").items()
-        })
-        start_hints_results = self.sample_items(
-            oe_state.start_hints, True, "Start Hints",
-            list(itertools.chain[LocationModel | ItemModel](
-                (i for i in type(self).gen_model.items if i.required_expedition in self.required_expeditions),
-                (l for l in self.reachable_locations)
-            ))
-        )
-        start_item_hints = Options.StartHints([
-            self.tag_model_by_id[entity.name_tag].name for entity in start_hints_results if entity is ItemModel
-        ])
-        start_location_hints = Options.StartLocationHints([
-            self.tag_model_by_id[entity.name_tag].name for entity in start_hints_results if entity is LocationModel
-        ])
+        #######################################################################
+        ## Regions, Locations, and Items
 
-        ## Spoof the options class so Archipelago doesn't throw errors
-        spoof_options = {
-            "local_items": local_items_setting,
-            "non_local_items": nonlocal_items_setting,
-            "start_inventory": start_inventory_setting,
-            "start_hints": start_item_hints,
-            "start_location_hints": start_location_hints,
-            "exclude_locations": options.ExcludeLocations(list()),
-            "priority_locations": options.PriorityLocations(list()),
-            "item_links": self.options.gtfo_item_links,
-            "plando_items": self.options.gtfo_plando_items,
+        ## Region reachability. We use some minor optimizations to guarantee we get all matches
+        self.reachable_regions = {
+            r for r in self.region_whitelist
+            if not GTFOWorld.tag_matches(r, self.region_blacklist, cls.region_model_by_id)
         }
-        for key, value in spoof_options.items():
-            self.options.__dict__[key] = value
+        for reg in cls.region_model_by_id.values():
+            if any(p in self.reachable_regions for p in reg.parents) and not reg.id in self.region_blacklist:
+                self.reachable_regions.add(reg.id)
+        self.reachable_regions = { r for r in self.reachable_regions if cls.region_model_by_id[r].reachable }
+
+        ## Calculating reachable and randomized locations
+        self.reachable_locations = list()
+        self.randomized_locations = list()
+        empty_locations: List[RealLocationTagModel] = list()
+        for loc in self.gen_model.locations:
+            if loc.value is None:
+                continue
+            loc: RealLocationTagModel
+            if any(r not in self.reachable_regions for r in loc.value.owning_regions):
+                continue
+
+            is_whitelisted = GTFOWorld.tag_matches(loc.id, self.location_whitelist, self.location_model_by_id)
+            is_blacklisted = GTFOWorld.tag_matches(loc.id, self.location_blacklist, self.location_model_by_id)
+
+            if loc.value.is_empty:
+                if is_whitelisted and not is_blacklisted:
+                    empty_locations.append(loc)
+            else:
+                assert loc.value.item_id != 0, f"Non-empty location has null item ID: {loc.id} - {loc.name}"
+                item_whitelisted = GTFOWorld.tag_matches(loc.value.item_id, self.item_whitelist, self.item_model_by_id)
+                item_blacklisted = GTFOWorld.tag_matches(loc.value.item_id, self.item_blacklist, self.item_model_by_id)
+                if (is_whitelisted or item_whitelisted) and not (is_blacklisted or item_blacklisted):
+                    self.randomized_locations.append(loc)
+                else:
+                    self.reachable_locations.append(loc)
+
+        ## We need to know our priority and exclude locations so we can pick empty locations ~intelligently~
+        def custom_combine(a: Dict[int, int], b: Set[str]) -> Iterable[tuple[int, int]]:
+            """Combine our custom tag set with the simpler location set"""
+            b = { cls.location_name_to_id_casefold[k.casefold()] for k in b }
+            keys = b.union(a.keys())
+            return [ (k, -1 if k in b else a[k]) for k in keys ]
+
+        priority_locations = set(
+            self.sample_tags(
+                (l.id for l in itertools.chain(self.randomized_locations, empty_locations)),
+                custom_combine(self.priority_locations, get_option(Options.PriorityLocations).value),
+                cls.location_model_by_id,
+                False,
+                GTFOPriorityLocations.display_name
+            ).keys()
+        )
+        exclude_locations = set(
+            self.sample_tags(
+                (l.id for l in itertools.chain(self.randomized_locations, empty_locations)),
+                custom_combine(self.exclude_locations, get_option(Options.ExcludeLocations).value),
+                cls.location_model_by_id,
+                False,
+                GTFOExcludeLocations.display_name
+            ).keys()
+        )
+
+        ## Grouping empty locations by priority
+        grouped_empty_locations: List[List[RealLocationTagModel]] = [[], [], []]
+        for loc in empty_locations:
+            cat: int = NotImplemented
+            if loc.id in priority_locations:
+                cat = 0
+            elif loc.id in exclude_locations:
+                cat = 2
+            else:
+                match loc.value.priority_mode:
+                    case "Priority":
+                        cat = 0
+                    case "Default":
+                        cat = 1
+                    case _:
+                        cat = 2
+            grouped_empty_locations[cat].append(loc)
+
+        ## Collecting a list of floating items
+        grouped_floating_items: List[List[int]] = [[], [], []]
+        for fi in cls.gen_model.floating_items:
+            is_randomized = True \
+                and fi.region in self.reachable_regions \
+                and GTFOWorld.tag_matches(fi.item, self.item_whitelist, cls.item_model_by_id) \
+                and not GTFOWorld.tag_matches(fi.item, self.item_blacklist, cls.item_model_by_id)
+            if not is_randomized:
+                continue
+            item = cls.item_model_by_id[fi.item]
+            if item.value is None:
+                raise Exception("Floating item contains id pointing to null item!")
+            if item.value.is_progression:
+                grouped_floating_items[0].append(item.id)
+            elif item.value.is_useful:
+                grouped_floating_items[1].append(item.id)
+            else:
+                grouped_floating_items[2].append(item.id)
+
+        ## Counts for all items we're using
+        self.item_pool = Counter(
+            itertools.chain(
+                (loc.value.item_id for loc in self.randomized_locations),
+                (i for items in grouped_floating_items for i in items)
+            )
+        )
+
+        ## Cash in the vouchers
+        sample = self.sample_tags(
+            self.item_pool.keys(),
+            self.start_vouchers.items(),
+            cls.item_model_by_id,
+            False,
+            StartVouchers.display_name,
+            repeats=self.item_pool.values()
+        )
+        starting_inventory = Counter(sample)
+        for tag, count in sample.items():
+            self.item_pool[tag] -= count
+
+        ## Remove relevant items from our floating distribution, if needed
+        for sublist in grouped_floating_items:
+            for j in reversed(range(len(sublist))):
+                item = sublist[j]
+                if sample[item] > 0:
+                    sample[item] -= 1
+                    sample[item] += 1
+                    sublist.pop(j)
+
+        ## Move non-empty locations into the empty set if necessary
+        high_priority_group = list()
+        grouped_empty_locations.insert(0, high_priority_group)
+        for loc in self.randomized_locations:
+            if sample[loc.value.item_id] > 0:
+                high_priority_group.append(loc)
+
+        ## We need to ensure those locations are filled. If necessary, create empty items for them
+        empty_count = len(high_priority_group) - sum(len(g) for g in grouped_floating_items)
+        if empty_count > 0:
+            self.grouped_floating_items[-1] += ( self.empty_item.id for _ in range(empty_count) )
+            self.item_pool[self.empty_item.id] += empty_count
+
+        ## Distributing them all!
+        queued_locations: List[RealLocationTagModel] = grouped_empty_locations.pop(0)
+        queued_items: List[int] = grouped_floating_items.pop(0)
+        self.filled_empty_locations = list()
+        while True:
+            while not queued_locations and grouped_empty_locations:
+                queued_locations.extend(grouped_empty_locations.pop(0))
+            while not queued_items and grouped_floating_items:
+                queued_items.extend(grouped_floating_items.pop(0))
+
+            count = min(len(queued_locations), len(queued_items))
+            if count == 0:
+                if self.fail_if_insufficient_empty_locations and queued_items and not queued_locations:
+                    raise Exception(f"Insufficient empty locations! {len(queued_items)} floating items unplaced!")
+                elif queued_items:
+                    starting_inventory.update(queued_items)
+                break
+
+            results = zip(
+                sorted(self.random.sample(range(len(queued_locations)), count), reverse=True),
+                sorted(self.random.sample(range(len(queued_items)), count), reverse=True),
+            )
+            for l, i in results:
+                loc = queued_locations.pop(l)
+                item = queued_items.pop(i)
+
+                if loc.value.is_empty: ## Because we mix in some non-empty locations during voucher claims
+                    loc.value.item_id = item
+                    self.filled_empty_locations.append((loc.id, item))
+                    self.randomized_locations.append(loc)
+
+        #######################################################################
+        ## Options Spoofing
+
+        ## Creating counters of encounterable items
+        item_counts = Counter( loc.value.item_id for loc in self.randomized_locations if loc.value.item_id != 0 )
+
+        sample = self.sample_tags(
+            item_counts.keys(),
+            self.local_items.items(),
+            cls.item_model_by_id,
+            False,
+            GTFOLocalItems.display_name,
+        )
+        opt = get_option(Options.LocalItems)
+        local_items_setting = Options.LocalItems(opt.value.union({
+            cls.item_model_by_id[item].name for item in sample.keys()
+        }))
+
+        sample = self.sample_tags(
+            item_counts.keys(),
+            self.non_local_items.items(),
+            cls.item_model_by_id,
+            False,
+            GTFONonLocalItems.display_name,
+        )
+        opt = get_option(Options.NonLocalItems)
+        non_local_items_setting = Options.LocalItems(opt.value.union({
+            cls.item_model_by_id[item].name for item in sample.keys()
+        }))
+
+        sample = self.sample_tags(
+            item_counts.keys(),
+            self.item_hints.items(),
+            cls.item_model_by_id,
+            False,
+            GTFOItemHints.display_name,
+        )
+        opt = get_option(Options.StartHints)
+        item_hints_setting = Options.StartHints(opt.value.union({
+            cls.item_model_by_id[item].name for item in sample.keys()
+        }))
+
+        sample = self.sample_tags(
+            (loc.id for loc in itertools.chain(self.reachable_locations, self.randomized_locations)),
+            self.location_hints.items(),
+            cls.location_model_by_id,
+            False,
+            GTFOLocationHints.display_name,
+        )
+        opt = get_option(Options.StartLocationHints)
+        location_hints_setting = Options.StartLocationHints(opt.value.union({
+            cls.location_model_by_id[item].name for item in sample.keys()
+        }))
+
+        def inventory_item_not_found(not_found_tag: int, not_found_count: int):
+            """Callback for if a starting inventory item is not found during sampling"""
+            item_model = cls.item_model_by_id[not_found_tag]
+            if not_found_count == 0:
+                return
+            if item_model.value is None:
+                raise Exception(
+                    f"No match for starting inventory item {item_model.name} could be found."
+                    + " No matching items are in the item pool, and that exact name is only a parent, not an item"
+                )
+            starting_inventory[not_found_tag] += not_found_count
+
+        item_counts.update( loc.value.item_id for loc in self.reachable_locations if loc.value.item_id != 0 )
+        sample = self.sample_tags(
+            item_counts.keys(),
+            self.start_inventory.items(),
+            cls.item_model_by_id,
+            True,
+            GTFOStartInventory.display_name,
+            on_none_found=inventory_item_not_found
+        )
+        starting_inventory.update(sample)
+        opt = get_option(Options.StartInventory)
+        named_starting_inventory = {
+            self.item_model_by_id[key].name: count for key, count in starting_inventory.items()
+        }
+        start_inventory_setting = Options.StartInventory(dict(Counter(named_starting_inventory) + Counter(opt.value)))
+
+        ## List of options we've provided spoofing implementations for
+        spoof_options: Dict[Type[Option], Option] = {
+            Options.LocalItems: local_items_setting,
+            Options.NonLocalItems: non_local_items_setting,
+            Options.StartInventory: start_inventory_setting,
+            Options.StartHints: item_hints_setting,
+            Options.StartLocationHints: location_hints_setting,
+            Options.ExcludeLocations: Options.PriorityLocations(
+                { cls.location_model_by_id[p].name for p in priority_locations }
+            ),
+            Options.PriorityLocations: Options.ExcludeLocations(
+                { cls.location_model_by_id[p].name for p in exclude_locations }
+            ),
+        }
+
+        def get_annotations_recursive(ty: Type) -> Iterable[Tuple[str, Type]]:
+            if ty == object:
+                return []
+            return itertools.chain(
+                inspect.get_annotations(ty, eval_str=True).items(),
+                *(get_annotations_recursive(b) for b in ty.__bases__)
+            )
+
+        for key, typ in get_annotations_recursive(Options.PerGameCommonOptions):
+            if issubclass(typ, Option):
+                if typ in spoof_options:
+                    setattr(self.options, key, spoof_options[typ])
+                else:
+                    setattr(self.options, key, get_option(typ))
+                #print(f"Set option: {key} to {typ.__name__}")
+
         return
 
     @override
@@ -341,202 +714,16 @@ class GTFOWorld(CachedRuleBuilderWorld):
         For the sake of simplicity, we will do all our work in this one method
         """
 
+        cls = type(self)
         #######################################################################
         ## Regions
 
         ## Create the regions!
-        region_lookup = { 
-            r.id: Region(r.name, self.player, self.multiworld)
-                for r in self.gen_model.regions if r.id in self.reachable_regions
+        region_lookup = {
+            r: Region(cls.region_model_by_id[r].name, self.player, self.multiworld) for r in self.reachable_regions
         }
-        if any( i not in region_lookup for i in self.reachable_regions ):
-            self.logger.error("Failed to find all expected regions during creation!")
         self.multiworld.regions += region_lookup.values()
-            
-        #######################################################################
-        ## Locations and Items Init
 
-        ## Reset locations and items (since the model is reused between players)
-        for gen_loc in type(self).gen_model.locations:
-            gen_loc.is_in_required_expeditions = gen_loc.is_whitelisted = gen_loc.is_blacklisted = False
-            if gen_loc.rand_data.is_empty:
-                gen_loc.item_id = 0
-        for gen_item in type(self).gen_model.items:
-            gen_item.is_in_required_expeditions = gen_item.is_whitelisted = gen_item.is_blacklisted = False
-
-        ## Set randomization on relevant locations
-        for gen_loc in self.reachable_locations:
-            gen_loc.is_in_required_expeditions = True
-            gen_loc.is_whitelisted = type(self).tags_match(*gen_loc.tags(), tag_set=self.whitelist_tags)
-            gen_loc.is_blacklisted = type(self).tags_match(*gen_loc.tags(), tag_set=self.blacklist_tags)
-
-        ## Set randomization on relevant items - we won't really be referencing the relevant item set after this
-        relevant_item_ids = { loc.item_id for loc in self.reachable_locations if loc.item_id != 0 }
-        relevant_item_ids.update(self.gen_model.floating_items)
-        for item_id in relevant_item_ids:
-            gen_item = self.item_model_by_id[item_id]
-            gen_item.is_in_required_expeditions = gen_item.required_expedition in self.required_expeditions
-            gen_item.is_whitelisted = type(self).tags_match(*gen_item.tags(), tag_set=self.whitelist_tags)
-            gen_item.is_blacklisted = type(self).tags_match(*gen_item.tags(), tag_set=self.blacklist_tags)
-
-        #######################################################################
-        ## Floating Item Distribution
-
-        self.filled_empty_locations = list()
-        floating_items: List[int] = []
-        def distribute(empty_locations: List[LocationModel]) -> None:
-            """Helper to distribute currently queued floating items into available empty locations"""
-            if not floating_items: ## Must have at least one floating item to distribute
-                return
-
-            step: float
-            if len(floating_items) >= len(empty_locations):
-                step = 1.0 ## Fill all locations
-            else:
-                step = len(floating_items) / len(empty_locations)
-            accum: float = 0.2 ## Starts at .2 to avoid rounding issues
-
-            for i in range(len(empty_locations)):
-                accum += step
-                if accum >= 1.0:
-                    index = (i + abs(self.root_seed)) % len(empty_locations)
-                    if empty_locations[index].item_id != 0:
-                        raise Exception("Overwriting floating item ID. I messed up somewhere!")
-                    empty_locations[index].item_id = floating_items.pop()
-                    accum -= 1.0
-                    self.filled_empty_locations.append((empty_locations[index].id, empty_locations[index].item_id))
-
-        ## Round 1: Progression items into priority locations
-        floating_items = [ 
-            i for i in self.gen_model.floating_items 
-            if self.item_model_by_id[i].should_be_randomized()
-            and self.item_model_by_id[i].rand_data.is_progression
-        ]
-        seen_items = { f for f in floating_items }
-        distribute([
-            l for l in self.reachable_locations
-            if l.should_be_randomized() and l.item_id == 0
-            and (
-                (l.rand_data.priority_mode == "Priority" and l.id not in self.exclude_locations)
-                or l.id in self.priority_locations
-            )
-        ])
-
-        ## Round 2: Progression items in all locations
-        distribute([
-            l for l in self.reachable_locations
-            if l.should_be_randomized() and l.item_id == 0
-            and (
-                (l.rand_data.priority_mode != "Excluded" and l.id not in self.exclude_locations)
-                or l.id in self.priority_locations
-            )
-        ])
-
-        ## Round 3: All items into all locations
-        floating_items.extend(
-            i for i in self.gen_model.floating_items 
-            if self.item_model_by_id[i].should_be_randomized()
-            and not i in seen_items
-        )
-        distribute([
-            l for l in self.reachable_locations
-            if l.should_be_randomized() and l.item_id == 0
-        ])
-
-        ## Round 4: All remaining items are given (or raise an exception)
-        if len(floating_items) > 0 and self.fail_if_insufficient_empty_locations:
-            raise Exception(
-                f"Insufficient empty locations! There are {len(floating_items)} unplaced floating items"
-                + "\nConsider adding more expeditions or, if possible, enabling more empty locations."
-            )
-        for i in floating_items:
-            name = self.tag_model_by_id[self.item_model_by_id[i].name_tag].name
-            self.logger.warning(f"Not enough empty locations. Adding starting item: {name}")
-            self.push_precollected(self.create_item_by_id(i))
-        
-        #######################################################################
-        ## Item Creation and Submission
-        rand_items: List[ItemModel] = []
-        for gen_location in self.reachable_locations:
-            ## Any location still empty is ignored!
-            if gen_location.item_id == 0:
-                continue
-            
-            ## Identify the name
-            loc_tag = self.tag_model_by_id.get(gen_location.name_tag, None)
-            if loc_tag is None:
-                self.logger.error(f"Name tag for location {gen_location.id} not found!")
-                continue
-
-            ## Identify the main region
-            if not gen_location.owning_regions:
-                self.logger.error(f"Location not contained in any regions: {loc_tag.name}")
-                continue
-            main_region = region_lookup.get(gen_location.owning_regions[0], None)
-            if main_region is None:
-                self.logger.error(f"Location's main region could not be found: {loc_tag.name}")
-                continue
-
-            ## Identify the progress type
-            progress_type = LocationProgressType.DEFAULT
-            if gen_location.rand_data.priority_mode == "Priority":
-                progress_type = LocationProgressType.PRIORITY
-            elif gen_location.rand_data.priority_mode in [ "Excluded", "Trap" ]:
-                progress_type = LocationProgressType.EXCLUDED
-
-            ## Build the location and item pair
-            location = GTFOLocation(self.player, loc_tag.name, gen_location.id, main_region)
-            location.progress_type = progress_type
-            main_region.locations.append(location)
-
-            ## Add the access rule (if needed)
-            if len(gen_location.owning_regions) > 1:
-                rule = And(*( CanReachRegion(region_lookup[r].name) for r in gen_location.owning_regions[1:] ))
-                self.set_rule(location, rule)
-
-            ## Either pair them together or randomize them!
-            gen_item = self.item_model_by_id[gen_location.item_id]
-            is_randomized = True \
-                and gen_location.is_in_required_expeditions and gen_item.is_in_required_expeditions \
-                and (gen_location.is_whitelisted or gen_item.is_whitelisted) \
-                and not (gen_location.is_blacklisted or gen_item.is_blacklisted)
-            if is_randomized:
-                rand_items.append(gen_item)
-                item_tag = self.tag_model_by_id[gen_item.name_tag]
-                self.logger.debug(f"Randomized: {location.name} - {item_tag.name}")
-            else:
-                item = self.create_item_by_model(gen_item, not gen_item.rand_data.is_randomlike)
-                location.address = gen_location.id if gen_item.rand_data.is_randomlike else None
-                location.place_locked_item(item)
-                self.logger.debug(f"Locked: {location.name} - {item.name}")
-
-        ## Handling unused floating items
-        ## Some unused floating items, such as expedition unlocks, are presumed held if not randomized.
-        ## We handle this by just giving it to the play as part of the starting inventory
-        for i in self.gen_model.floating_items:
-            gen_item = self.item_model_by_id[i]
-            if (not gen_item.should_be_randomized()) and gen_item.rand_data.is_collected_by_default:
-                self.multiworld.push_precollected(self.create_item_by_model(gen_item))
-        
-        #######################################################################
-        ## Start Vouchers and Early Items
-
-        start_items = self.sample_items(self.start_vouchers, False, "start_vouchers", rand_items)
-        for i in range(len(rand_items)):
-            gen_item = rand_items[i]
-            count = start_items.get(gen_item, 0)
-            if count <= 0: continue
-            start_items[gen_item] = count - 1
-            rand_items[i] = type(self).empty_item_model
-            self.multiworld.push_precollected(self.create_item_by_model(gen_item))
-
-        early_items = self.sample_items(self.early_items, False, "early_items", rand_items)
-        early_items_dict = self.multiworld.early_items.setdefault(self.player, dict())
-        early_items_dict.update({ self.tag_model_by_id[k.name_tag].name: v for k, v in early_items.items() })
-
-        ## Finally, we simply add any remaining randomized items to the pool
-        self.multiworld.itempool.extend(self.create_item_by_model(m) for m in rand_items)
-        
         #######################################################################
         ## Paths
 
@@ -547,90 +734,123 @@ class GTFOWorld(CachedRuleBuilderWorld):
             end_region = region_lookup.get(gen_path.ending_region, None)
             if start_region is None or end_region is None:
                 continue
-            path_name = f"{start_region.name} -> {end_region.name}" \
-                if gen_path.name is None else gen_path.name
 
             ## Build the rule
-            path_rule: Optional[Rule] = None
-            if gen_path.name == "R6B1 (Main) ZONE_33 Main Entry":
-                path_rule = False_()
+            def make_rule(req: PathReqModel) -> Rule:
+                req_count = req.count
+                if req.type in ("ItemGrowing", "CategoryGrowing"):
+                    req_count += self.growing_item_counts[req.target]
+                    self.growing_item_counts[req.target] = req_count
 
-            if gen_path.req_item.type != "None":
-                target_tag = type(self).tag_model_by_id[gen_path.req_item.target]
-
-                if gen_path.req_item.type == "Item":
-                    path_rule = Has(target_tag.name, gen_path.req_count)
-                elif gen_path.req_item.type == "Category":
-                    if not target_tag.name in type(self).item_name_groups:
-                        type(self).item_name_groups[target_tag.name] = set()
-                    path_rule = HasGroup(target_tag.name, gen_path.req_count)
-                elif gen_path.req_item.type == "Blocked":
-                    path_rule = False_()
+                if req.type in ("Item", "ItemConsumed", "ItemGrowing"):
+                    target_tag = cls.item_model_by_id[req.target]
+                    return Has(target_tag.name, req_count)
+                elif req.type in ("Category", "CategoryGrowing"):
+                    target_tag = cls.item_model_by_id[req.target]
+                    if not target_tag.name in cls.item_name_groups:
+                        ## Condition is impossible to satisfy
+                        ## This can happen if no items in the desired category actually exist
+                        return False_()
+                    return HasGroup(target_tag.name, req_count)
                 else:
                     raise Exception(f"Unknown path req type: {gen_path.req_item.type}")
-                path_rule: Rule
 
-                if gen_path.alt_item.type != "None":
-                    target_tag = self.tag_model_by_id[gen_path.alt_item.target]
-
-                    if gen_path.alt_item.type == "Item":
-                        path_rule = Or(path_rule, Has(target_tag.name, 1))
-                    elif gen_path.alt_item.type == "Category":
-                        if not target_tag.name in type(self).item_name_groups:
-                            type(self).item_name_groups[target_tag.name] = set()
-                        path_rule = Or(path_rule, HasGroup(target_tag.name, 1))
-                    elif gen_path.req_item.type == "Blocked":
-                        path_rule = Or(path_rule, False_())
-                    else:
-                        raise Exception(f"Unknown path alt type: {gen_path.alt_item.type}")
+            path_rule = And( *(make_rule(r) for r in gen_path.reqs) ) if gen_path.reqs else True_()
 
             ## Create the path!
+            path_name = f"Path {gen_path.id} {start_region.name} -> {end_region.name}" \
+                if gen_path.name is None else gen_path.name
             start_region.connect(end_region, path_name, path_rule)
-            self.logger.debug(f"Path {start_region.name} -> {end_region.name} | Rule: {path_rule.__str__()}")
+
+        #######################################################################
+        ## Item Creation and Submission
+
+        def create_location(loc_model: RealLocationTagModel) -> GTFOLocation:
+            """Creates a GTFO location from its model"""
+
+            ## Identify the location's 'main' region
+            assert loc_model.value.owning_regions, f"Error while placing location {loc_model.id}; no owning regions"
+            main_region = region_lookup.get(loc_model.value.owning_regions[0])
+            assert main_region is not None, f"Error while placing location {loc_model.id}; main region not found"
+
+            ## Compile 'other' regions for reference
+            other_regions = [ region_lookup.get(r) for r in loc_model.value.owning_regions ]
+            assert all(r is not None for r in other_regions), \
+                f"Error while placing location {loc_model.id}; one of the other regions was not found"
+            other_regions: List[Region]
+
+            ## Identify the location's progress type (priority)
+            progress_type = LocationProgressType.DEFAULT
+            if loc_model.value.priority_mode == "Priority":
+                progress_type = LocationProgressType.PRIORITY
+            elif loc_model.value.priority_mode in [ "Excluded", "Trap" ]:
+                progress_type = LocationProgressType.EXCLUDED
+
+            ## Create the location!
+            result = GTFOLocation(self.player, loc_model.name, loc_model.id, main_region)
+            result.progress_type = progress_type
+            main_region.locations.append(result)
+            if other_regions:
+                self.set_rule(result, And( *(CanReachRegion(o.name) for o in other_regions) ))
+            return result
+
+        ## Non-randomized locations will be modified to be event pairs
+        for loc in self.reachable_locations:
+            location = create_location(loc)
+            item_model = cls.item_model_by_id[loc.value.item_id]
+            assert item_model.value is not None, "Locations contains fake item model"
+            item_model: RealItemTagModel
+            if not (item_model.value.is_randomlike and not loc.value.is_empty):
+                location.address = None
+            item = self.create_item_by_model(item_model)
+            location.place_locked_item(item)
+
+        ## Randomized locations
+        for loc in self.randomized_locations:
+            create_location(loc)
+
+        ## Randomized items
+        for item_id in self.item_pool.elements():
+            item = self.create_item_by_id(item_id)
+            self.multiworld.itempool.append(item)
+
+        ## Sample and apply early items
+        early_items = self.sample_tags(
+            self.item_pool.keys(),
+            self.early_items.items(),
+            self.item_model_by_id,
+            False,
+            EarlyItems.display_name,
+            repeats=self.item_pool.values()
+        )
+        early_items_dict = self.multiworld.early_items.setdefault(self.player, dict())
+        early_items_dict.update( (self.item_model_by_id[k].name, v) for (k, v) in early_items.items() )
 
         #######################################################################
         ## Goal Condition
 
-        ## Set the tags so we can filter by tag for relevant goal items
-        wl = { type(self).tag_model_by_name["Goal Items".lower()].id } ## By default, all goal items
-        bl = set()
-
-        ## Check each item ID that is *actually* spawned (including if it's spawned multiple times)
-        all_item_ids = itertools.chain( 
-            ( loc.item_id for loc in self.reachable_locations ),
-            self.gen_model.floating_items
+        self.goal_item_results = self.sample_tags(
+            itertools.chain(
+                self.item_pool.keys(),
+                (loc.value.item_id for loc in self.reachable_locations)
+            ),
+            self.goal_items.items(),
+            self.item_model_by_id,
+            False,
+            GoalItems.display_name,
+            itertools.chain(
+                self.item_pool.values(),
+                (1 for _ in self.reachable_locations)
+            )
         )
-
-        ## Collect all goal items!
-        all_goal_items = list()
-        for item_id in all_item_ids:
-            if item_id == 0: continue
-            gen_item = self.item_model_by_id[item_id]
-
-            if gen_item.required_expedition not in self.required_expeditions: continue
-            if not type(self).tags_match(*gen_item.tags(), tag_set=wl): continue
-            if type(self).tags_match(*gen_item.tags(), tag_set=bl): continue
-
-            all_goal_items.append(gen_item)
-
-        ## From available goal items, sample the items to be removed
-        blacklisted_items = self.sample_items(self.goal_blacklist, False, "goal_blacklist", all_goal_items)
-
-        ## Sort through the goal items and add them to our requirements
-        goal_names: List[str] = []
-        self.goal_items = []
-        for gen_item in all_goal_items:
-            blacklist_count = blacklisted_items.get(gen_item, 0)
-            if blacklist_count > 0:
-                blacklisted_items[gen_item] = blacklist_count - 1
-                continue
-
-            goal_names.append(type(self).tag_model_by_id[gen_item.name_tag].name)
-            self.goal_items.append(gen_item.id)
-
-        ## Rule!
-        desired_count: int = len(goal_names) - self.skippable_goal_count
-        self.set_completion_rule(HasFromList(*goal_names, count=desired_count))
+        total = self.goal_item_results.total()
+        if total <= 0:
+            self.logger.error("No goal items found for world!")
+            raise Exception("No goal items found for world!")
+        self.set_completion_rule(HasFromList(
+            *( self.item_model_by_id[i].name for i in self.goal_item_results.elements() ),
+            count=total-self.skippable_goal_count
+        ))
 
     @override
     def create_item(self, item_name: str) -> GTFOItem:
@@ -638,54 +858,45 @@ class GTFOWorld(CachedRuleBuilderWorld):
         Create an item for this world type and player.
         Warning: this may be called with self.world = None, for example by MultiServer
         """
-        item_id = self.item_name_to_id.get(item_name, None)
+        item_id = self.item_name_to_id_casefold.get(item_name.casefold(), None)
         if item_id is None:
-            self.logger.warning(f"Failed to look up item by name: {item_name}, using filler instead")
-            return self.create_filler()
+            raise Exception(f"Failed to look up item by name: {item_name}; cannot create null item")
         return self.create_item_by_id(item_id)
     
     def create_item_by_id(self, item_id: int) -> GTFOItem:
         """
         Create a particular item from just its ID.
         """
-        gen_item = self.item_model_by_id.get(item_id, None)
-        if gen_item is None:
-            self.logger.error(f"Failed to create item by id: {item_id}, using filler instead")
-            return self.create_filler()
-        
-        return self.create_item_by_model(gen_item)
+        item_model = self.item_model_by_id.get(item_id, None)
+        if item_model is None:
+            self.logger.error(f"Failed to create item by id: {item_id}; item model not found")
+            raise Exception(f"Failed to create item by id: {item_id}; item model not found")
+        elif item_model.value is None:
+            self.logger.error(f"Failed to create item by id: {item_id}; item model has no value")
+            raise Exception(f"Failed to create item by id: {item_id}; item model has no value")
+        item_model: RealItemTagModel
+        return self.create_item_by_model(item_model)
 
-    def create_item_by_model(self, gen_item: ItemModel, is_event: bool = False) -> GTFOItem:
-
+    def create_item_by_model(self, item_model: RealItemTagModel) -> GTFOItem:
+        """
+        Create a particular item from its model.
+        """
         ## Create classification data
         classification: ItemClassification = cast(ItemClassification, 0)
-        if gen_item.rand_data.is_progression:
+        if item_model.value.is_progression:
             classification |= ItemClassification.progression
-        if gen_item.rand_data.is_useful:
+        if item_model.value.is_useful:
             classification |= ItemClassification.useful
-        if gen_item.rand_data.is_filler:
+        if item_model.value.is_filler:
             classification |= ItemClassification.filler
-        if gen_item.rand_data.is_trap:
+        if item_model.value.is_trap:
             classification |= ItemClassification.trap
-        if gen_item.rand_data.do_skip_balancing:
+        if item_model.value.do_skip_balancing:
             classification |= ItemClassification.skip_balancing
-        if gen_item.rand_data.is_deprioritized:
+        if item_model.value.is_deprioritized:
             classification |= ItemClassification.deprioritized
 
-        ## Identify the name
-        name_tag = self.tag_model_by_id.get(gen_item.name_tag, None)
-        if name_tag is None:
-            self.logger.error(f"Failed to find name tag for item with id: {gen_item.id}")
-            return self.create_filler()
-
-        ## Create the item
-        item = GTFOItem(name_tag.name, classification, gen_item.id, self.player)
-
-        ## If it's an event, we can modify it
-        if is_event:
-            item.code = None
-
-        return item
+        return GTFOItem(item_model.name, classification, item_model.id, self.player)
 
     @override
     def get_filler_item_name(self):
@@ -698,101 +909,118 @@ class GTFOWorld(CachedRuleBuilderWorld):
 
     @override
     def fill_slot_data(self) -> Mapping[str, Any]:
-        return {
-            "RootSeed": self.root_seed,
-            "ExpeditionNames": self.required_expeditions,
-            "WhitelistTags": self.whitelist_tags,
-            "BlacklistTags": self.blacklist_tags,
-            "FilledEmptyLocations": self.filled_empty_locations,
-            "GoalItems": self.goal_items,
-            "SkippableGoalCount": self.skippable_goal_count
-        }
+        return SlotDataModel({
+            "root_seed": self.root_seed,
+            "region_whitelist": self.region_whitelist,
+            "region_blacklist": self.region_blacklist,
+            "location_whitelist": self.location_whitelist,
+            "location_blacklist": self.location_blacklist,
+            "item_whitelist": self.item_whitelist,
+            "item_blacklist": self.item_blacklist,
+            "filled_empty_locations": self.filled_empty_locations,
+            "goal_items": list(self.goal_item_results.items()),
+            "skippable_goal_count": self.skippable_goal_count,
+        }).dump()
 
-    @classmethod
-    def tag_matches(cls, tag: int, tag_set: Set[int]) -> bool:
-        """Check if a tag matches against a set of tags. Adds the tag's parents if it does."""
+    @staticmethod
+    def tag_matches(tag: int, tag_set: Set[int], tag_dict: Mapping[int, TagModel]) -> bool:
+        """Check if a tag matches against a set of tags given its reference dict"""
+        if tag == 0:
+            return False
         if tag in tag_set:
             return True
 
-        tag_def: Optional[TagModel] = cls.tag_model_by_id.get(tag, None)
-        if tag_def is not None and cls.tag_matches(tag_def.parent, tag_set):
-            #tag_set.add(tag)
+        tag_def: Optional[TagModel] = tag_dict.get(tag, None)
+        if tag_def is not None and any(GTFOWorld.tag_matches(p, tag_set, tag_dict) for p in tag_def.parents):
             return True
         else:
             return False
 
-    @classmethod
-    def tags_match(cls, *tags: int, tag_set: Set[int]) -> bool:
-        """Returns true if any tag matches against the set of tags"""
-        return any( cls.tag_matches(tag, tag_set) for tag in tags )
+    @staticmethod
+    def tag_matches_single(tag: int, parent: int, tag_dict: Mapping[int, TagModel]) -> bool:
+        """Check if a tag matches against a set of tags given its reference dict"""
+        if tag == 0:
+            return False
+        if tag == parent:
+            return True
 
-    def sample_items(self, desired_tags: Mapping[int, int], allow_duplicates: bool, debug_name: str,
-                     source_list: Optional[List[ItemModel | LocationModel]] = None
-                     ) -> Dict[ItemModel | LocationModel, int]:
+        tag_def: Optional[TagModel] = tag_dict.get(tag, None)
+        if tag_def is not None and any(GTFOWorld.tag_matches_single(p, parent, tag_dict) for p in tag_def.parents):
+            return True
+        else:
+            return False
+
+    def sample_tags(self, src: Iterable[int], desired: Iterable[Tuple[int, int]], lookup: Mapping[int, TagModel],
+                    allow_duplicates: bool, debug_name: str, repeats: Optional[Iterable[int]] = None,
+                    on_none_found: Optional[Callable[[int, int], None]] = None) -> Counter[int]:
         """
-        Samples and returns a dict of (object, count) entries from the provided list matching the desired_tags arg.
-        Tries to avoid duplicates. source_list defaults to all declared items in required_expeditions.
+        Samples a collection of tag IDs with respect to a target multiset of tags. For each (tag, count) in `desired`,
+        attempts to find `count` tags which match or are children of `tag`, with aversion to duplicates.
+         -> `allow_duplicates` optionally allows duplicates to be provided if `count` is greater than what's available
+         -> `repeats`, if provided, should be equal in length to `src` and indicates how many copies of each source
+            item should be provided.
+         -> `on_none_found` is called when candidates are not found for a tag. It is called with (tag, count).
+            If None (the default), this will instead raise an error if count is greater than 0.
         """
-        ## Set up defaults
-        if source_list is None:
-            source_list = [
-                item for item in self.gen_model.items
-                if item.required_expedition in self.required_expeditions
-            ]
+        if repeats is None:
+            repeats = itertools.repeat(1)
+        src = list(zip(src, repeats))
 
-        results: Dict[ItemModel | LocationModel, int] = {}
-        def add_result(items: List[ItemModel | LocationModel]) -> None:
-            """Small helper to add items to the results"""
-            for it in items:
-                results[it] = results.get(it, 0) + 1
-
-        for key, value in desired_tags.items():
+        results: Counter[int] = Counter() ## Multiset
+        for tag, count in desired:
             ## Ignore empty keys in case we happen across them
-            if value == 0:
+            if count == 0:
                 continue
 
             ## Collect items from source list which match
-            candidates = [
-                item for item in source_list
-                if type(self).tags_match(*item.tags(), tag_set={key})
-            ]
+            candidates = Counter()
+            for t, repeat in src:
+                if GTFOWorld.tag_matches_single(t, tag, lookup):
+                    candidates[t] += repeat
 
-            if not candidates:
-                self.logger.warning(
-                    f"Desired {value} items for tag {key} ({type(self).tag_model_by_id[key].name}) in {debug_name}"
-                    + f" but only found {len(candidates)} matches"
-                )
+            total = candidates.total()
+            if total <= 0:
+                if on_none_found is not None:
+                    on_none_found(tag, count)
+                elif count > 0:
+                    msg = f"During sampling, found no matches for tag {tag} ({lookup[tag].name}) in {debug_name}"
+                    self.logger.warning(msg)
+                    if self.fail_during_sampling:
+                        raise Exception(msg)
                 continue
 
-            ## Move duplicates to a separate list
-            duplicates = list()
-            for i in reversed(range(len(candidates))):
-                if results.get(candidates[i], 0) > 0:
-                    duplicates.append(candidates[i])
-                    candidates.pop(i)
+            ## Move duplicates to a separate counter
+            duplicates = Counter()
+            for t, qty in candidates.items():
+                result = results[t]
+                if result > 0:
+                    dif = min(result, qty)
+                    duplicates[t] = dif
+                    candidates[t] -= dif
 
             ## Deal with / apply duplication if necessary
-            if len(candidates) < value:
+            total = candidates.total()
+            if total < count:
                 if not allow_duplicates:
-                    self.logger.warning(
-                        f"Desired {value} items for tag {key} in {debug_name},"
-                        + f" but only found {len(candidates)} matches"
-                    )
-                    value = -1
+                    msg = f"Desired {count} items for tag {tag} in {debug_name}, but only found {total} matches"
+                    self.logger.warning(msg)
+                    if self.fail_during_sampling:
+                        raise Exception(msg)
+                    count = -1
                 else:
-                    add_result(candidates)
-                    value -= len(candidates)
-                    candidates.extend(duplicates)
-                    #duplicates = candidates ## Not necessary right now
-                    while len(candidates) < value:
-                        add_result(candidates)
-                        value -= len(candidates)
+                    results.update(candidates)
+                    count -= total
+                    candidates.update(duplicates)
+                    total = candidates.total()
+                    while total < count:
+                        results.update(candidates)
+                        count -= total
 
             ## Add sample
-            if value == -1:
-                add_result(candidates)
-            elif value > 0: ## Small edge case we need to catch where value == 0
-                add_result(self.random.sample(candidates, value))
+            if count == -1:
+                results.update(candidates)
+            elif count > 0: ## Small edge case we need to catch where count == 0
+                results.update(self.random.sample(list(candidates.keys()), k=count, counts=candidates.values()))
 
         return results
 
@@ -826,15 +1054,12 @@ class GTFOWorldBuilder:
         gen_model: Optional[GameDataModel] = None
         try:
             with file.open("r") as file_data:
-                gen_model = GameDataModel.model_validate_json(file_data.read())
+                gen_model = GameDataModel(json.load(file_data))
         except OSError as e:  ## Failed to open file
             cls.logger.error(f"Failed open GTFO MID file: {filename}")
             cls.logger.exception(e)
         except json.JSONDecodeError as e:  ## JSON parsing failed
             cls.logger.error(f"Failed to parse GTFO MID file: {filename}")
-            cls.logger.exception(e)
-        except ValidationError as e:  ## pydantic failed to validate data
-            cls.logger.error(f"Failed to validate GTFO MID data: {filename}")
             cls.logger.exception(e)
         except Exception as e:  ## Generic failure during gen_model instantiation
             cls.logger.error(f"Malformed GTFO MID data: {filename}")
@@ -872,7 +1097,7 @@ class GTFOWorldBuilder:
             file = importlib.resources.files().joinpath("data").joinpath("GTFO.ini")
             gen_model = cls.try_load_file(file, "builtin")
             if gen_model is None:
-                raise NotImplementedError
+                raise Exception("Failed to load vanilla GTFO world from apworld file")
             found_worlds[None] = gen_model
 
         ## Create all the worlds!
@@ -898,36 +1123,54 @@ class GTFOWorldBuilder:
         world_class.__doc__ = GTFOWorldBuilder.docstring
         world_class.gen_model = gen_model
         world_class.class_logger = logging.getLogger(f"GTFO.{gen_model.name}")
-        world_class.tag_model_by_id = { tag.id: tag for tag in gen_model.tags }
-        world_class.tag_model_by_name = { tag.name.lower(): tag for tag in gen_model.tags }
+        world_class.region_name_to_id_casefold = { reg.name.casefold(): reg.id for reg in gen_model.regions }
+        world_class.region_model_by_id = { reg.id: reg for reg in gen_model.regions }
+        gen_model.paths.sort(key=lambda path: path.name if path.name is not None else "")
+        world_class.location_name_to_id = { loc.name: loc.id for loc in gen_model.locations }
+        world_class.location_name_to_id_casefold = { loc.name.casefold(): loc.id for loc in gen_model.locations }
+        world_class.location_model_by_id = { loc.id: loc for loc in gen_model.locations }
         world_class.item_model_by_id = { item.id: item for item in gen_model.items }
-        world_class.location_name_to_id = \
-            { world_class.tag_model_by_id[loc.name_tag].name: loc.id for loc in gen_model.locations }
-        world_class.item_name_to_id = \
-            { world_class.tag_model_by_id[item.name_tag].name: item.id for item in gen_model.items }
+        world_class.item_name_to_id = { item.name: item.id for item in gen_model.items }
+        world_class.item_name_to_id_casefold = { item.name.casefold(): item.id for item in gen_model.items }
 
-        empty_item = world_class.item_name_to_id.get("Empty", None)
+        empty_item = world_class.item_name_to_id_casefold.get("Empty".casefold(), None)
         if empty_item is None:
             world_class.class_logger.error(f"Failed to find the empty item for GTFO world: {gen_model.name}")
         else:
-            world_class.empty_item_model = world_class.item_model_by_id[empty_item]
-
-        ## Set up item groups and name mapping
-        world_class.item_name_groups = dict()
-        world_class.item_mapping = dict()
-        for gen_item in gen_model.items:
-            if gen_item.path_reqs.type != "Category": continue
-            item_name = world_class.tag_model_by_id[gen_item.name_tag].name
-            group_name = world_class.tag_model_by_id[gen_item.path_reqs.target].name
-
-            group = world_class.item_name_groups.get(group_name, None)
-            if group is None:
-                group = { item_name }
-                world_class.item_name_groups[group_name] = group
+            empty_item_model = world_class.item_model_by_id[empty_item]
+            if empty_item_model.value is None:
+                world_class.logger.error(f"Empty item has no value for GTFO world: {gen_model.name}")
             else:
-                group.add(item_name)
+                empty_item_model: RealItemTagModel
+                world_class.empty_item_model = empty_item_model
 
-            world_class.item_mapping[item_name] = group_name
+        ## Set up location groups
+        world_class.location_name_groups = dict()
+        def add_location_group_recursive(l_name: str, tag_id: int):
+            """Helper to add locations to groups"""
+            if tag_id == 0: return
+            tag_model = world_class.location_model_by_id[tag_id]
+            world_class.location_name_groups.setdefault(tag_model.name, set()).add(l_name)
+            for p in tag_model.parents:
+                add_location_group_recursive(l_name, p)
+
+        for gen_loc in gen_model.locations:
+            if gen_loc.value is not None:
+                add_location_group_recursive(gen_loc.name, gen_loc.id)
+
+        ## Set up item groups
+        world_class.item_name_groups = dict()
+        def add_item_group_recursive(i_name: str, tag_id: int):
+            """Helper to add items to groups"""
+            if tag_id == 0: return
+            tag_model = world_class.item_model_by_id[tag_id]
+            world_class.item_name_groups.setdefault(tag_model.name, set()).add(i_name)
+            for p in tag_model.parents:
+                add_item_group_recursive(i_name, p)
+
+        for gen_item in gen_model.items:
+            if gen_item.value is not None:
+                add_item_group_recursive(gen_item.name, gen_item.id)
 
         ###########################################################################################
         ## Options creation
@@ -937,43 +1180,85 @@ class GTFOWorldBuilder:
 
         ## Define the options dataclass
         options_dict = { "__annotations__": dict() }
-        #options_dict = GTFOOptions.__dict__.copy()
-        #del options_dict["__init__"] ## Fun little quirk which would prevent dataclass from generating a new __init__
 
         ## Options grouping by name; we later calc the option groups once we've created all option inputs
-        option_groups_raw: Dict[str, List[Type[Options.Option]]] = options.gtfo_option_grouping.copy()
+        option_groups_raw = options.gtfo_option_grouping.copy()
 
         ## Search for and add input options
         for option in gen_model.options:
 
-            ## If this is an input, add it to the options dataclass
             if isinstance(option, OptionInputModel):
-
-                ## Create the option class
                 option: OptionInputModel
-                option_base, option_dict = option.get_class()
-                option_name = option.get_name()
-                option_class = type(option_base)(option_name, (option_base,), option_dict)
+                option_class = option.create_class(gen_model.name)
+                group = option_groups_raw.setdefault(option.category, list())
+                group.append((option.category_sort, option_class))
 
-                ## Add the option to the options class and groupings
-                options_dict["__annotations__"][option_name] = option_class
-                group = option_groups_raw.get(option.category, None)
-                if group is None:
-                    group = list()
-                    option_groups_raw[option.category] = group
-                group.append(option_class)
+        ## Sort option groups
+        for option_group in option_groups_raw.values():
+            option_group.sort(key=lambda pair: pair[0])
+
+        ## Push options to class as annotations
+        names: Set[str] = set()
+        for tup in (o for os in option_groups_raw.values() for o in os):
+            display_name = getattr(tup[1], "display_name", tup[1].__name__)
+            assert isinstance(display_name, str), f"display_name is not a string!"
+            options_dict["__annotations__"][display_name] = tup[1]
+            names.add(display_name)
+
+        ## Define an init function (normally done via dataclass decorator)
+        def init(self, **kwargs: Option):
+            if kwargs.keys() != names:
+                raise Exception(
+                    "Unexpected number of inputs to generated options class's __init__"
+                    f"\nMissing inputs: {names - kwargs.keys()}"
+                    f"\nExtra inputs: {kwargs.keys() - names}"
+                )
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+        options_dict["__init__"] = init # type: ignore[misc]
 
         ## Finally, create the options dataclass and assign it to our generated world
-        options_class = type(GTFOOptions)(f"{world_class.game} options_dataclass", (GTFOOptions,), options_dict)
-        options_class = cast(GTFOOptions, dataclasses.dataclass(options_class, init=True))
+        options_class = type(Options.CommonOptions)(f"GTFO Options ({gen_model.name})", (object,), options_dict)
+        #options_class = cast(CommonOptions, dataclasses.dataclass(options_class, init=True))
         world_class.options_dataclass = options_class
-        world_class.option_groups = [ Options.OptionGroup(name, items) for name, items in option_groups_raw.items() ]
+
+        ###########################################################################################
+        ## Web World creation
+
+        ## Defining a derived class
+        web_class = SimpleNamespace()
+        web_class: Type[WebWorld]
+        web_class.option_groups = [
+            Options.OptionGroup(name, [i[1] for i in items]) for name, items in option_groups_raw.items() if name != ""
+        ]
+        web_class = type(WebWorld)(f"GTFO WebWorld ({gen_model.name})", (WebWorld,), web_class.__dict__)
+        web_class: Type[WebWorld]
+
+        ## Creating an instance of that derived class
+        web = web_class()
+        web.options_page = True
+        web.game_model = ["en"]
+        web.tutorials = [] ## TODO
+        web.theme = "stone"
+        web.bugreports = "https://github.com/RoboRyGuy/Archipelago-GTFO/issues"
+        web.options_presets = dict()
+        web.rich_text_options_doc = True
+        web.location_descriptions = {
+            t.name: t.description for t in gen_model.locations
+        }
+        web_class.item_descriptions = {
+            t.name: t.description for t in gen_model.items
+        }
+
+        ## Assign to new world
+        world_class.web = web
 
         ###########################################################################################
         ## Create the world class!
 
         ## Note that we use the metaclass associated with GTFOWorld to create the derived instance
-        return cast(Type[GTFOWorld], type(GTFOWorld)(f"GTFO ({gen_model.name})", (GTFOWorld,), world_class.__dict__))
+        return cast(Type[GTFOWorld], type(GTFOWorld)(f"GTFO World ({gen_model.name})", (GTFOWorld,), world_class.__dict__))
 
 ## Now we simply create all the GTFO worlds
 GTFOWorldBuilder.make_worlds()
