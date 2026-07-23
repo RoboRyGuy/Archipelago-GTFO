@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections.abc
 import itertools
+import sys
 import typing
 from typing import Any, cast, ClassVar, Collection, Dict, Iterable, List, Literal, Optional, Set, Tuple,  Type, \
     TYPE_CHECKING, Union
@@ -544,13 +545,15 @@ class OptionMultiChoiceModel(OptionChoiceModel):
                 count_raw = data.get('random', 1)
                 del data['random']
                 count_raw: str
+                keys = [ k for k, v in data.items() if v > 0 ]
+                values = [ v for v in data.values() if v > 0 ]
                 try:
                     count = int(count_raw)
                     if count == -1:
-                        count = len(data)
+                        count = len(keys)
                     elif count < -1:
                         raise Exception("Cannot parse option; desired random count is less than -1")
-                    elif count > len(data):
+                    elif count > len(keys):
                         raise Exception(
                             "Cannot parse option; desired random count is greater than number of available choices."
                             + "\nUse -1 as the value for `random` if you wish to select all choices."
@@ -558,17 +561,12 @@ class OptionMultiChoiceModel(OptionChoiceModel):
                 except ValueError:
                     low, high = count_raw.split("-", 1)
                     low, high = int(low), int(high)
-                    if low == -1: low = len(data)
-                    if high == -1: high = len(data)
+                    if low == -1: low = len(keys)
+                    if high == -1: high = len(keys)
                     if low > high:
                         low, high = high, low
                     count = (low, high)
-                return OptionMultiChoiceModel.MultiChoiceOption(
-                    { "random" },
-                    [ k for k, v in data.items() if v > 0 ],
-                    [ v for v in data.values() if v > 0 ],
-                    count
-                )
+                return OptionMultiChoiceModel.MultiChoiceOption({ "random" }, keys, values, count)
             except: ## If we fail, simply ignore it
                 return super(OptionMultiChoiceModel.MultiChoiceOption, cls).from_any(data)
 
@@ -581,10 +579,13 @@ class OptionMultiChoiceModel(OptionChoiceModel):
         namespace.valid_keys_casefold = True
         namespace.default = "random" if self.default_value == 0 \
             else self.choice_names[self.choice_values.index(self.default_value)]
+        if cast(str, sys.modules['__main__'].__file__).endswith("OptionsCreator.py"):
+            namespace.default = { namespace.default }
         namespace.__doc__ = ("" if namespace.__doc__ is None else namespace.__doc__) \
-            + "\n\nYou may randomly select one or more values; each value can be individually weighted." \
-            + "\nYou may choose how many options to select using the special option 'random'." \
-            + "\nFor example, `random: 3` selects 3 options. `random: 2-5` selects 2 to 5 options."
+            + "\n\nYou may either provide a list of values or a mapping of `name: weight` pairs." \
+            + "\nIf using a mapping, you may choose how many options to select using the special value" \
+            + "\n'random'. For example, `random: 3` selects 3 options. `random: 2-5` selects 2 to 5 options." \
+            + "\n`random: -1` will select all values with a weight greater than 0."
         return namespace.__dict__
 
     def get_base_class(self) -> Type[Options.Option]:

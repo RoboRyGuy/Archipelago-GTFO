@@ -352,7 +352,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
         move_to_tag_dict(
             opt.value,
             self.location_hints,
-            cls.item_name_to_id_casefold,
+            cls.location_name_to_id_casefold,
             opt.display_name
         )
 
@@ -361,7 +361,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
         move_to_tag_dict(
             opt.value,
             self.priority_locations,
-            cls.item_name_to_id_casefold,
+            cls.location_name_to_id_casefold,
             opt.display_name
         )
 
@@ -370,7 +370,7 @@ class GTFOWorld(CachedRuleBuilderWorld):
         move_to_tag_dict(
             opt.value,
             self.exclude_locations,
-            cls.item_name_to_id_casefold,
+            cls.location_name_to_id_casefold,
             opt.display_name
         )
 
