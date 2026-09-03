@@ -4,9 +4,10 @@ import collections.abc
 import itertools
 import sys
 import typing
-from typing import Any, cast, ClassVar, Collection, Dict, Iterable, List, Literal, Optional, Set, Tuple,  Type, \
-    TYPE_CHECKING, Union
+from typing import Any, cast, ClassVar, Collection, Dict, FrozenSet, Iterable, List, Literal, Optional, Set, Tuple, \
+    Type, TYPE_CHECKING, Union
 from types import SimpleNamespace
+import yaml
 
 import Options
 
@@ -33,8 +34,11 @@ class SlotDataModel(BaseModel):
     item_whitelist: Set[int]
     item_blacklist: Set[int]
     filled_empty_locations: List[Tuple[int, int]]
-    goal_items: List[Tuple[int, int]]
+    goal_item_results: List[Tuple[int, int]]
     skippable_goal_count: int
+
+    ## Required for UT
+    start_inventory_results: List[Tuple[int, int]]
 
     def __init__(self, data: Dict[str, Any]):
         super().__init__(data)
@@ -46,8 +50,11 @@ class SlotDataModel(BaseModel):
         self.item_whitelist = data['item_whitelist']
         self.item_blacklist = data['item_blacklist']
         self.filled_empty_locations = data['filled_empty_locations']
-        self.goal_items = data['goal_items']
+        self.goal_item_results = data['goal_item_results']
         self.skippable_goal_count = data['skippable_goal_count']
+
+        ## Required for UT
+        self.start_inventory_results = data['start_inventory_results']
 
     def dump(self) -> Dict[str, Any]:
         result = super().dump()
@@ -59,8 +66,12 @@ class SlotDataModel(BaseModel):
         result['item_whitelist'] = self.item_whitelist
         result['item_blacklist'] = self.item_blacklist
         result['filled_empty_locations'] = self.filled_empty_locations
-        result['goal_items'] = self.goal_items
+        result['goal_item_results'] = self.goal_item_results
         result['skippable_goal_count'] = self.skippable_goal_count
+
+        ## Required for UT
+        result['start_inventory_results'] = self.start_inventory_results
+
         return result
 
 class GameDataModel(BaseModel):
@@ -71,6 +82,7 @@ class GameDataModel(BaseModel):
     items: List[ItemTagModel]
     paths: List[PathModel]
     floating_items: List[FloatingItemModel]
+    choices: List[ChoiceModel]
     options: List[OptionBaseModel]
 
     def __init__(self, data: Dict[str, Any]):
@@ -82,6 +94,7 @@ class GameDataModel(BaseModel):
         self.items = [ ItemTagModel(d) for d in data['items']]
         self.paths = [ PathModel(d) for d in data['paths'] ]
         self.floating_items = [ FloatingItemModel(d) for d in data['floating_items'] ]
+        self.choices = [ ChoiceModel(d) for d in data['choices'] ]
         self.options = [ OptionBaseModel.construct(d) for d in data['options'] ]
 
     def dump(self) -> Dict[str, Any]:
@@ -93,6 +106,7 @@ class GameDataModel(BaseModel):
         result['items'] = [ m.dump() for m in self.items ]
         result['paths'] = [ m.dump() for m in self.paths ]
         result['floating_items'] = [ m.dump() for m in self.floating_items ]
+        result['choices'] = [ m.dump() for m in self.choices ]
         result['options'] = [ m.dump() for m in self.options ]
         return result
 
@@ -261,22 +275,55 @@ class PathModel(BaseModel):
         return result
 
 class PathReqModel(BaseModel):
-    type: Literal[ "Item", "ItemConsumed", "ItemGrowing", "Category", "CategoryGrowing" ]
     target: int
     count: int
+    is_category: bool
+    is_consume: bool
+    is_growing: bool
 
     def __init__(self, data: Dict[str, Any]):
         super().__init__(data)
-        self.type = data['type']
         self.target = data['target']
         self.count = data['count']
+        self.is_category = data['is_category']
+        self.is_consume = data['is_consume']
+        self.is_growing = data['is_growing']
 
     def dump(self) -> Dict[str, Any]:
         result = super().dump()
-        result['type'] = self.type
         result['target'] = self.target
         result['count'] = self.count
+        result['is_category'] = self.is_category
+        result['is_consume'] = self.is_consume
+        result['is_growing'] = self.is_growing
         return result
+
+class ChoiceModel(BaseModel):
+    choice_paths: FrozenSet[int]
+    regions: List[int]
+    region_ranges: List[Tuple[int, int]]
+    id: int = 0
+    region_set: Optional[Set[int]] = None
+
+    def __init__(self, data: Dict[str, Any]):
+        super().__init__(data)
+        self.choice_paths = frozenset(data['choice_paths'])
+        self.regions = data['regions']
+        self.region_ranges = data['region_ranges']
+
+    def dump(self) -> Dict[str, Any]:
+        result = super().dump()
+        result['choice_paths'] = list(self.choice_paths)
+        result['regions'] = self.regions
+        result['region_ranges'] = self.region_ranges
+        return result
+
+    def get_regions(self) -> Set[int]:
+        if self.region_set is None:
+            self.region_set: Set[int] = set()
+            self.region_set.update(self.regions)
+            self.region_set.update( r for s, e in self.region_ranges for r in range(s, e + 1) )
+        return self.region_set
 
 ## Options API ####################################################################################
 
@@ -422,14 +469,14 @@ class OptionInputModel(OptionBaseModel):
 
     def get_class_instance(self, oe: OptionsEvaluator) -> Options.Option:
         """The option's instance from the options class in the world"""
-        instance = getattr(oe.parent_world.options, self.display_name)
+        instance = getattr(oe.options, self.display_name)
         if instance is None:
             msg = f"Failed to find option input: {self.display_name}"
-            oe.parent_world.logger.error(msg)
+            oe.options.logger.error(msg)
             raise Exception(msg)
         elif not isinstance(instance, self.get_base_class()):
             msg = f"Option found input but it was the wrong type: {self.display_name}"
-            oe.parent_world.logger.error(msg)
+            oe.options.logger.error(msg)
             raise Exception(msg)
         instance: Options.Option
         return instance
@@ -475,6 +522,8 @@ class OptionChoiceModel(OptionInputModel):
         klass = super().create_class(world_name)
         klass: Type[Options.Choice]
 
+        assert len(self.choice_names) > 0, \
+            "Choice option does not have any choices!"
         assert len(self.choice_names) == len(self.choice_values), \
             "Choice option does not have equal number of choice names and values!"
 
@@ -534,8 +583,8 @@ class OptionMultiChoiceModel(OptionChoiceModel):
                      random_choices: Optional[List[str]] = None,
                      random_weights: Optional[List[int]] = None,
                      random_count: Union[int, Tuple[int, int]] = 1):
-            self.random_choices = None if random_choices is None else random_choices
-            self.random_weights = None if random_weights is None else random_weights
+            self.random_choices = random_choices
+            self.random_weights = random_weights
             self.random_count = random_count
             super().__init__(value, None)
 
@@ -570,6 +619,17 @@ class OptionMultiChoiceModel(OptionChoiceModel):
             except: ## If we fail, simply ignore it
                 return super(OptionMultiChoiceModel.MultiChoiceOption, cls).from_any(data)
 
+    class ThisDefaultValue(dict):
+        """
+        This class exists purely to let me format this option correctly when generating templates.
+        We register a YAML representer for this class below OptionMuiltiChoiceModel's definition.
+        """
+
+        @staticmethod
+        def representer(dumper, obj):
+            return dumper.represent_mapping('tag:yaml.org,2002:map', obj.items())
+
+
     def create_namespace(self) -> Dict[str, Any]:
         namespace = super().create_namespace()
         namespace = SimpleNamespace(**namespace)
@@ -577,10 +637,32 @@ class OptionMultiChoiceModel(OptionChoiceModel):
         namespace.supports_weighting = False
         namespace.valid_keys = itertools.chain((key.casefold() for key in self.choice_names), ("random", ))
         namespace.valid_keys_casefold = True
-        namespace.default = "random" if self.default_value == 0 \
-            else self.choice_names[self.choice_values.index(self.default_value)]
-        if cast(str, sys.modules['__main__'].__file__).endswith("OptionsCreator.py"):
-            namespace.default = { namespace.default }
+
+        ## Collect the defaults
+        defaults: Set[str] = set()
+        d = self.default_value
+        x = 0
+        while d > 0:
+            if d & 1 != 0:
+                defaults.add(self.choice_names[x])
+            x = x + 1
+            d = d >> 1
+
+        ## We have to format our option differently if we're being used by OptionsCreator
+        if getattr(sys.modules['__main__'], "__file__", "").endswith("OptionsCreator.py"):
+            namespace.default = defaults
+        elif defaults:
+            namespace.default = OptionMultiChoiceModel.ThisDefaultValue()
+            namespace.default["random"] = -1
+            namespace.default.update({k: 0 for k in self.choice_names})
+            for d in defaults:
+                namespace.default[d] = 50
+        else:
+            namespace.default = OptionMultiChoiceModel.ThisDefaultValue()
+            namespace.default["random"] = 0
+            namespace.default.update({k: 50 for k in self.choice_names})
+        namespace.supports_weighting = False
+
         namespace.__doc__ = ("" if namespace.__doc__ is None else namespace.__doc__) \
             + "\n\nYou may either provide a list of values or a mapping of `name: weight` pairs." \
             + "\nIf using a mapping, you may choose how many options to select using the special value" \
@@ -592,6 +674,7 @@ class OptionMultiChoiceModel(OptionChoiceModel):
         return OptionMultiChoiceModel.MultiChoiceOption
 
     def create_class(self, world_name: str) -> Type[Options.Option]:
+        return super(OptionChoiceModel, self).create_class(world_name)
         klass = super().create_class(world_name)
         klass: Type[Options.OptionSet]
         ## We're simply adding 'random' as a special option, at the front, so it populates when generating templates
@@ -617,7 +700,7 @@ class OptionMultiChoiceModel(OptionChoiceModel):
             count = instance.random_count
             try:
                 low, high = count
-                count = oe.parent_world.random.randrange(low, high + 1)
+                count = oe.options.random.randrange(low, high + 1)
             except TypeError:
                 pass
             count: int
@@ -627,7 +710,7 @@ class OptionMultiChoiceModel(OptionChoiceModel):
                 assert any(w > 0 for w in weights), \
                     f"Cannot randomly sample item from option {self.display_name}; all remaining weights are zero!" \
                     + f"\nAttempted to sample {original_count} items, failed on item {original_count - count + 1}"
-                sample = oe.parent_world.random.sample(range(len(options)), 1, counts=weights)[0]
+                sample = oe.options.random.sample(range(len(options)), 1, counts=weights)[0]
                 values.add(options.pop(sample))
                 weights.pop(sample)
                 count -= 1
@@ -635,6 +718,8 @@ class OptionMultiChoiceModel(OptionChoiceModel):
             values = instance.value
         lookup = { name: value for name, value in zip(self.choice_names, self.choice_values) }
         return [ lookup[value] for value in values if value != 'random' ]
+
+yaml.add_representer(OptionMultiChoiceModel.ThisDefaultValue, OptionMultiChoiceModel.ThisDefaultValue.representer)
 
 class OptionOperationModel(OptionBaseModel):
     pass
@@ -1032,7 +1117,8 @@ class OptionIsFakeGenerationModel(OptionBaseModel):
     type: Literal["IsFakeGeneration"] = "IsFakeGeneration"
 
     def evaluate(self, oe: OptionsEvaluator) -> Collection[int]:
-        return Repeat(1 if getattr(oe.parent_world.multiworld, "generation_is_fake", False) else 0)
+        is_fake = oe.world_instance is not None and getattr(oe.world_instance.multiworld, "generation_is_fake", False)
+        return Repeat(1 if is_fake else 0)
 
 class OptionTagOptionModel(OptionInputModel):
     tag: OptionParameterModel
@@ -1092,27 +1178,27 @@ class OptionRegionTagOptionModel(OptionTagOptionModel):
     type: Literal["RegionTagOption"] = "RegionTagOption"
 
     def get_whitelist(self, oe: OptionsEvaluator) -> Set[int]:
-        return oe.parent_world.region_whitelist
+        return oe.options.region_whitelist
 
     def get_blacklist(self, oe: OptionsEvaluator) -> Set[int]:
-        return oe.parent_world.region_blacklist
+        return oe.options.region_blacklist
 
 @gtfo_option
 class OptionLocationTagOptionModel(OptionTagOptionModel):
     type: Literal["LocationTagOption"] = "LocationTagOption"
 
     def get_whitelist(self, oe: OptionsEvaluator) -> Set[int]:
-        return oe.parent_world.location_whitelist
+        return oe.options.location_whitelist
 
     def get_blacklist(self, oe: OptionsEvaluator) -> Set[int]:
-        return oe.parent_world.location_blacklist
+        return oe.options.location_blacklist
 
 @gtfo_option
 class OptionItemTagOptionModel(OptionTagOptionModel):
     type: Literal["ItemTagOption"] = "ItemTagOption"
 
     def get_whitelist(self, oe: OptionsEvaluator) -> Set[int]:
-        return oe.parent_world.item_whitelist
+        return oe.options.item_whitelist
 
     def get_blacklist(self, oe: OptionsEvaluator) -> Set[int]:
-        return oe.parent_world.item_blacklist
+        return oe.options.item_blacklist
